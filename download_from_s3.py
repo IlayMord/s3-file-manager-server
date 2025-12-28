@@ -1,8 +1,8 @@
 import boto3
 
-BUCKET = "ilay-bucket-devops"      #The name of the bucket
-KEY = "try.py"                     #The name of the file in S3
-LOCAL_PATH = "/home/ubuntu/try.py" #Path to save
+BUCKET = "ilay-bucket-devops"      
+KEY = "try.py"                     
+LOCAL_PATH = "/home/ubuntu/try.py" 
 
 s3 = boto3.client("s3")
 
