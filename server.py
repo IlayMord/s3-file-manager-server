@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import http.server
 import socketserver
 import urllib.parse
@@ -5,13 +6,57 @@ import cgi
 import boto3
 import os
 import ssl
+import shutil
+import subprocess
 
 
 PORT = 443
 BUCKET = "ilay-bucket1"
 
+
+# --------------------------
+#  BOOTSTRAP (AWS + SSL)
+# --------------------------
+
+def ensure_aws_cli():
+    try:
+        subprocess.run(["aws", "--version"], check=True)
+        print("✔ AWS CLI is installed")
+    except Exception:
+        print("⚠ AWS CLI missing — running starter.sh...")
+        subprocess.run(["bash", "starter.sh"], check=True)
+
+
+def ensure_ssl_cert():
+    if not (os.path.exists("cert.pem") and os.path.exists("key.pem")):
+        print("⚠ SSL certificate missing — generating...")
+        subprocess.run([
+            "openssl","req","-newkey","rsa:2048","-nodes",
+            "-keyout","key.pem",
+            "-x509","-days","365",
+            "-out","cert.pem",
+            "-subj","/C=IL/ST=None/L=None/O=Server/CN=localhost"
+        ], check=True)
+        os.chmod("key.pem", 0o600)
+        print("✔ cert.pem + key.pem created")
+    else:
+        print("✔ SSL certificate exists")
+
+
+ensure_aws_cli()
+ensure_ssl_cert()
+
+
+# --------------------------
+#  S3 CLIENT
+# --------------------------
+
 s3 = boto3.client("s3")
 
+
+# --------------------------
+#  HTTP HANDLER
+# --------------------------
 
 class UploadHandler(http.server.BaseHTTPRequestHandler):
 
@@ -36,6 +81,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             """
 
         return rows or "<tr><td colspan='3' class='empty'>Bucket is empty</td></tr>"
+
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -191,6 +237,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode())
 
+
     def do_POST(self):
         try:
             ctype, _ = cgi.parse_header(self.headers.get("Content-Type"))
@@ -221,13 +268,16 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
 
+
+# --------------------------
+#  HTTPS SERVER
+# --------------------------
+
 with socketserver.TCPServer(("", PORT), UploadHandler) as httpd:
     print(f"Serving S3 manager on port {PORT} (HTTPS)")
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile="cert.pem", keyfile="key.pem")
-
     httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
 
     httpd.serve_forever()
-
