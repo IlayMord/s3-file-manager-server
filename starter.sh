@@ -23,27 +23,4 @@ if [[ ! -f cert.pem || ! -f key.pem ]]; then
   chmod 600 key.pem
 fi
 
-echo "===> Checking AWS CLI..."
-if ! command -v aws >/dev/null 2>&1; then
-  curl -O https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
-  unzip -o awscli-exe-linux-x86_64.zip
-  sudo ./aws/install
-  sudo ln -sf /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws || true
-  rm -rf aws awscli-exe-linux-x86_64.zip
-fi
-
-echo "===> Allowing Python to bind port 443 (no sudo needed)..."
-sudo setcap 'cap_net_bind_service=+ep' "$(readlink -f .venv/bin/python3)" || true
-
-echo "===> Verifying server file..."
-if [[ ! -f server.py ]]; then
-  echo "❌ server.py not found in this directory"
-  exit 1
-fi
-
-echo "===> Starting server on HTTPS:443..."
-.venv/bin/python3 server.py &
-SERVER_PID=$!
-
-echo "✔ Environment ready — server is running (pid: $SERVER_PID)"
-echo "👉 To stop it: kill $SERVER_PID"
+echo "✔ Environment ready"
