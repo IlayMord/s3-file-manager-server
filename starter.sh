@@ -15,7 +15,7 @@ pip install boto3 botocore
 
 [[ -f requirements.txt ]] && pip install -r requirements.txt || true
 
-echo "===> Checking SSL..."
+echo "===> Checking SSL certs..."
 if [[ ! -f cert.pem || ! -f key.pem ]]; then
   openssl req -newkey rsa:2048 -nodes \
     -keyout key.pem -x509 -days 365 \
@@ -32,4 +32,18 @@ if ! command -v aws >/dev/null 2>&1; then
   rm -rf aws awscli-exe-linux-x86_64.zip
 fi
 
-echo "✔ Environment ready"
+echo "===> Allowing Python to bind port 443 (no sudo needed)..."
+sudo setcap 'cap_net_bind_service=+ep' "$(readlink -f .venv/bin/python3)" || true
+
+echo "===> Verifying server file..."
+if [[ ! -f server.py ]]; then
+  echo "❌ server.py not found in this directory"
+  exit 1
+fi
+
+echo "===> Starting server on HTTPS:443..."
+.venv/bin/python3 server.py &
+SERVER_PID=$!
+
+echo "✔ Environment ready — server is running (pid: $SERVER_PID)"
+echo "👉 To stop it: kill $SERVER_PID"
