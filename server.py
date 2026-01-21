@@ -6,28 +6,23 @@ import os, sys, subprocess
 def ensure_environment_ready():
     def need_bootstrap():
         try:
-            import boto3, ssl  # noqa
+            import boto3
         except Exception:
             return True
-
-        # SSL files must exist before starting HTTPS
-        if not os.path.exists("cert.pem") or not os.path.exists("key.pem"):
-            return True
-
         return False
 
     if not need_bootstrap():
         return
 
-    print("⚠ Environment not ready — running starter.sh...")
+    print("⚠ Environment not ready — running setup.sh...")
 
-    if not os.path.exists("starter.sh"):
-        print("❌ starter.sh is missing — automatic setup cannot continue")
+    if not os.path.exists("setup.sh"):
+        print("❌ setup.sh is missing — automatic setup cannot continue")
         sys.exit(1)
 
-    subprocess.run(["bash", "starter.sh"], check=True)
+    subprocess.run(["bash", "setup.sh"], check=True)
 
-    # Relaunch the same process after the environment has been prepared
+    # Relaunch after environment is ready
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 ensure_environment_ready()
@@ -38,9 +33,10 @@ import boto3, ssl, json
 
 def resolve_port():
     try:
-        return int(os.getenv("S3MGR_PORT", "443"))
+        return int(os.getenv("S3MGR_PORT", "80"))
     except Exception:
-        return 443
+        return 80
+
 
 def resolve_config_dir():
     env_dir = os.getenv("S3MGR_CONFIG_DIR")
@@ -1034,11 +1030,9 @@ class ReusableTCPServer(socketserver.TCPServer):
 
 try:
     with ReusableTCPServer(("", PORT), UploadHandler) as httpd:
-        print(f"Serving S3 manager on port {PORT} (HTTPS)")
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain("cert.pem", "key.pem")
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        print(f"Serving S3 manager on port {PORT} (HTTP)")
         httpd.serve_forever()
 except OSError as e:
     print(f"Server failed to start on port {PORT}: {e}")
     sys.exit(1)
+
