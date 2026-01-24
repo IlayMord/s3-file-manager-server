@@ -1240,12 +1240,19 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             showAlert('Bulk action', 'Select files or folders first');
             return;
           }
-          if (action === 'delete' && !confirm('Delete selected items?')) {
+          if (action === 'delete') {
+            showConfirm('Delete selected', 'Delete all selected items? This cannot be undone.', function() {
+              proceedBulk(action, keys, form, target, targetHidden);
+            });
             return;
           }
           var form = document.getElementById('bulkForm');
           var target = document.getElementById('bulkTarget');
           var targetHidden = document.getElementById('bulkTargetHidden');
+          if (!form) return;
+          proceedBulk(action, keys, form, target, targetHidden);
+        }
+        function proceedBulk(action, keys, form, target, targetHidden) {
           if (!form) return;
           form.querySelectorAll('input[name="keys"]').forEach(function(el) { el.remove(); });
           keys.forEach(function(k) {
