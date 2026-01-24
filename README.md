@@ -50,10 +50,8 @@ The app stores configuration in:
 - `/tmp/s3-file-manager/app_config.json` (fallback)
 
 You can override paths/ports with environment variables:
-- `S3MGR_PORT` (default: `80`)
-- `S3MGR_CONFIG_DIR`
-- `S3MGR_USERNAME` (default: `admin`)
-- `S3MGR_PASSWORD` (empty means no auth)
+- `S3FM_PORT` (default: `80`)
+- `S3FM_CONFIG_DIR`
 
 ## 📝 Notes
 - `/download` streams to the browser. `/download-server` saves to `/tmp/<filename>` on the server host.

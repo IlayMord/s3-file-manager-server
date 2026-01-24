@@ -11,13 +11,13 @@ import boto3, ssl, json
 
 def resolve_port():
     try:
-        return int(os.getenv("S3MGR_PORT", "80"))
+        return int(os.getenv("S3FM_PORT", "80"))
     except Exception:
         return 80
 
 
 def resolve_config_dir():
-    env_dir = os.getenv("S3MGR_CONFIG_DIR")
+    env_dir = os.getenv("S3FM_CONFIG_DIR")
     if env_dir:
         return env_dir
     default_dir = os.path.join(os.path.expanduser("~"), ".s3-file-manager")
@@ -34,8 +34,6 @@ CONFIG_DIR = resolve_config_dir()
 CONFIG_FILE = os.path.join(CONFIG_DIR, "app_config.json")
 LEGACY_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "app_config.json")
 CONFIG_ERROR = ""
-AUTH_USER = os.getenv("S3MGR_USERNAME", "admin")
-AUTH_PASSWORD = os.getenv("S3MGR_PASSWORD", "")
 
 
 # ---------- CONFIG ----------
@@ -1371,26 +1369,6 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(text.encode("utf-8"))
 
-    def is_authenticated(self):
-        if not AUTH_PASSWORD:
-            return True
-        header = self.headers.get("Authorization", "")
-        if not header.startswith("Basic "):
-            return False
-        try:
-            encoded = header.split(" ", 1)[1].strip()
-            decoded = base64.b64decode(encoded).decode("utf-8")
-            user, pwd = decoded.split(":", 1)
-            return user == AUTH_USER and pwd == AUTH_PASSWORD
-        except Exception:
-            return False
-
-    def send_auth_required(self):
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="S3 File Manager"')
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Authentication required")
 
     def presign_url(self, key, expires=900):
         try:
@@ -1451,9 +1429,6 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
     # ===== GET =====
     def do_GET(self):
         global config, s3
-        if not self.is_authenticated():
-            return self.send_auth_required()
-
         # No bucket has been configured yet
         if not config.get("bucket"):
             return self.respond(self.render_bucket_form())
@@ -1955,9 +1930,6 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
     # ===== POST =====
     def do_POST(self):
         global config, s3
-        if not self.is_authenticated():
-            return self.send_auth_required()
-
         if self.path == "/save-bucket":
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length).decode()
