@@ -83,3 +83,13 @@ You can override paths/ports with environment variables:
 ## 📝 Notes
 - `/download` streams to the browser. `/download-server` saves to `/tmp/<filename>` on the server host.
 - Credentials are stored locally on the server and are not encrypted.
+
+## 🏗 Architecture Diagram
+
+![Architecture Diagram](docs/architecture.png)
+
+This diagram shows the full deployment architecture:
+- Terraform provisions the AWS infrastructure (VPC, EC2, Security Group).
+- EC2 runs Docker and Docker Compose.
+- The application runs as a container and accesses Amazon S3 using an IAM Role.
+- Users access the web UI via HTTP on port 80.
