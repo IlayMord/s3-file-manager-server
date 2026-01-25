@@ -7,7 +7,8 @@ import mimetypes
 import time
 import os
 import sys
-import boto3, ssl, json
+import logging
+import boto3, json
 from cryptography.fernet import Fernet
 
 def resolve_port():
@@ -35,6 +36,45 @@ CONFIG_DIR = resolve_config_dir()
 CONFIG_FILE = os.path.join(CONFIG_DIR, "app_config.json")
 LEGACY_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "app_config.json")
 CONFIG_ERROR = ""
+SECRET_FILE = os.path.join(CONFIG_DIR, "secret.key")
+LOG_DIR = os.path.join(CONFIG_DIR, "logs")
+LOG_FILE = os.path.join(LOG_DIR, "app.log")
+
+
+def setup_logging():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+
+# ENCRYPTION
+def load_or_create_secret():
+    if os.path.exists(SECRET_FILE):
+        with open(SECRET_FILE, "rb") as f:
+            return f.read()
+    key = Fernet.generate_key()
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(SECRET_FILE, "wb") as f:
+        f.write(key)
+    return key
+
+FERNET = Fernet(load_or_create_secret())
+
+def encrypt(text):
+    return FERNET.encrypt(text.encode()).decode()
+
+def decrypt(token):
+    try:
+        return FERNET.decrypt(token.encode()).decode()
+    except Exception:
+        # Backwards compatibility for configs saved before encryption.
+        return token
 
 
 # ---------- CONFIG ----------
@@ -1427,7 +1467,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 break
             token = resp.get("NextContinuationToken", "")
 
-    # ===== GET =====
+    # GET
     def do_GET(self):
         global config, s3
         # No bucket has been configured yet
@@ -1581,14 +1621,16 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             try:
                 key = q.get("file", [""])[0]
                 s3.delete_object(Bucket=config["bucket"], Key=key)
+                logging.info("Delete object key=%s bucket=%s", key, config.get("bucket"))
                 back = f"/?prefix={urllib.parse.quote(prefix)}"
                 if query:
                     back += f"&q={urllib.parse.quote(query)}"
                 return self.respond(f"<script>location='{back}'</script>")
             except Exception:
+                logging.exception("Delete failed")
                 return self.respond("<html><body>Delete failed</body></html>")
 
-        # ===== List objects with folder-style prefixes =====
+        # List objects with folder-style prefixes
         try:
             list_args = {
                 "Bucket": config["bucket"],
@@ -1928,7 +1970,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         """
         self.respond(page_html)
 
-    # ===== POST =====
+    # POST 
     def do_POST(self):
         global config, s3
         if self.path == "/save-bucket":
@@ -1978,6 +2020,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                     name += "/"
                 key = (prefix or "") + name
                 s3.put_object(Bucket=config["bucket"], Key=key, Body=b"")
+                logging.info("Create folder key=%s bucket=%s", key, config.get("bucket"))
             back = f"/?prefix={urllib.parse.quote(prefix)}" if prefix else "/"
             return self.respond(f"<script>location='{back}'</script>")
 
@@ -2008,6 +2051,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                             token = resp.get("NextContinuationToken", "")
                     else:
                         s3.delete_object(Bucket=config["bucket"], Key=key)
+                logging.info("Bulk delete count=%s bucket=%s", len(keys), config.get("bucket"))
                 return self.respond(f"<script>location='{back}'</script>")
             if action in ["move", "copy"] and target:
                 for key in keys:
@@ -2024,6 +2068,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                         )
                         if action == "move":
                             s3.delete_object(Bucket=config["bucket"], Key=key)
+                logging.info("Bulk action=%s count=%s target=%s bucket=%s", action, len(keys), target, config.get("bucket"))
                 return self.respond(f"<script>location='{back}'</script>")
             return self.respond("<html><body>Bulk action failed</body></html>")
 
@@ -2057,6 +2102,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                     Key=new_key
                 )
                 s3.delete_object(Bucket=config["bucket"], Key=old_key)
+            logging.info("Rename old=%s new=%s bucket=%s", old_key, new_key, config.get("bucket"))
             return self.respond(f"<script>location='{back}'</script>")
 
         # Handle upload (including prefix when provided)
@@ -2087,44 +2133,22 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                     continue
                 key = (prefix or "") + filename
                 s3.upload_fileobj(item.file, config["bucket"], key)
+                logging.info("Upload key=%s bucket=%s", key, config.get("bucket"))
             back = f"/?prefix={urllib.parse.quote(prefix)}" if prefix else "/"
             return self.respond(f"<script>location='{back}'</script>")
         except Exception as e:
-            sys.stderr.write(f"Upload failed: {e}\n")
+            logging.exception("Upload failed")
             return self.respond_text(500, f"Upload failed: {e}")
 
-SECRET_FILE = os.path.join(CONFIG_DIR, "secret.key")
-
-def load_or_create_secret():
-    if os.path.exists(SECRET_FILE):
-        with open(SECRET_FILE, "rb") as f:
-            return f.read()
-    key = Fernet.generate_key()
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(SECRET_FILE, "wb") as f:
-        f.write(key)
-    return key
-
-FERNET = Fernet(load_or_create_secret())
-
-def encrypt(text):
-    return FERNET.encrypt(text.encode()).decode()
-
-def decrypt(token):
-    try:
-        return FERNET.decrypt(token.encode()).decode()
-    except Exception:
-        # Backwards compatibility for configs saved before encryption.
-        return token
-
-# ---------- HTTPS SERVER ----------
+# HTTP SERVER 
 class ReusableTCPServer(socketserver.TCPServer):
     allow_reuse_address = True
 
+setup_logging()
 try:
     with ReusableTCPServer(("", PORT), UploadHandler) as httpd:
-        print(f"Serving S3 manager on port {PORT} (HTTP)")
+        logging.info("Serving S3 manager on port %s (HTTP)", PORT)
         httpd.serve_forever()
 except OSError as e:
-    print(f"Server failed to start on port {PORT}: {e}")
+    logging.error("Server failed to start on port %s: %s", PORT, e)
     sys.exit(1)
