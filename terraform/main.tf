@@ -7,14 +7,14 @@ module "vpc" {
 
 module "nlb" {
   source    = "./modules/nlb"
-  name      = "s3mgr"
+  name      = "s3fm"
   subnet_id = module.vpc.subnet_id
   vpc_id    = module.vpc.vpc_id
 }
 
 module "asg" {
   source            = "./modules/asg"
-  name              = "s3mgr"
+  name              = "s3fm"
   subnet_id         = module.vpc.subnet_id
   security_group_id = module.vpc.security_group_id
   target_group_arn = module.nlb.target_group_arn
