@@ -44,9 +44,10 @@ Stop:
 docker compose -f docker/docker-compose.yml down
 ```
 
-## ☁️ Terraform (EC2 Auto Deploy)
-This repo includes Terraform modules that create a VPC + EC2 instance and use
-user-data to clone this repo and start the Docker container.
+## ☁️ Terraform (NLB + ASG Auto Deploy)
+This repo includes Terraform modules that create a VPC + Network Load Balancer
+and an Auto Scaling Group. The ASG uses user-data to clone this repo and start
+the Docker container.
 
 ### Steps
 1) Configure AWS credentials locally.
@@ -57,13 +58,13 @@ cd terraform
 terraform init
 terraform apply
 ```
-4) When it finishes, grab the public IP:
+4) When it finishes, grab the NLB DNS name:
 ```bash
-terraform output public_ip
+terraform output nlb_dns_name
 ```
 5) Open in your browser:
 ```
-http://<PUBLIC_IP>
+http://<NLB_DNS_NAME>
 ```
 
 ### What user-data does
@@ -73,7 +74,8 @@ http://<PUBLIC_IP>
 
 ### Modules
 - `terraform/modules/vpc` creates the VPC, subnet, and security group.
-- `terraform/modules/ec2` creates the EC2 instance and injects user-data.
+- `terraform/modules/nlb` creates the Network Load Balancer and target group.
+- `terraform/modules/asg` creates the Auto Scaling Group and injects user-data.
 
 ## ⚙️ Configuration
 The app stores configuration in:
@@ -101,7 +103,7 @@ cannot be decrypted.
 ![Architecture Diagram](docs/architecture.png)
 
 This diagram shows the full deployment architecture:
-- Terraform provisions the AWS infrastructure (VPC, EC2, Security Group).
-- EC2 runs Docker and Docker Compose.
+- Terraform provisions the AWS infrastructure (VPC, NLB, ASG, Security Group).
+- ASG instances run Docker and Docker Compose.
 - The application runs as a container and accesses Amazon S3 using an IAM Role.
 - Users access the web UI via HTTP on port 80.
