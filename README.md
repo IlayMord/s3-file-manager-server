@@ -13,11 +13,12 @@ Runs locally and stores configuration on the server.
 - Preview for common file types (images, video, audio, text, PDF)
 - Share links via pre-signed URLs
 - Bulk actions (move, copy, delete) and rename
+- Email/password authentication with server-side sessions (Postgres)
 - AWS credentials are stored encrypted on disk
-- Theme toggle (light/dark)
 
 ## ✅ Requirements
-- Python 3.8+
+- Python 3.8+ (Docker image uses 3.11)
+- PostgreSQL (for users/sessions/app settings)
 - AWS credentials with access to the target S3 bucket
 - Existing S3 bucket
 
@@ -33,6 +34,9 @@ python3 app/server.py
 
 Then open `http://localhost:80` in your browser (or the port you set).
 
+### Local env vars
+- `S3FM_DB_URL` (default: `postgresql://postgres:postgres@localhost:5432/s3_file_manager`)
+
 ## 🐳 Docker
 Build and run with compose:
 ```bash
@@ -43,6 +47,8 @@ Stop:
 ```bash
 docker compose -f docker/docker-compose.yml down
 ```
+
+The compose file includes PostgreSQL and wires `S3FM_DB_URL` automatically.
 
 ## ☁️ Terraform (NLB + ASG Auto Deploy)
 This repo includes Terraform modules that create a VPC + Network Load Balancer
@@ -85,6 +91,7 @@ The app stores configuration in:
 You can override paths/ports with environment variables:
 - `S3FM_PORT` (default: `80`)
 - `S3FM_CONFIG_DIR`
+- `S3FM_DB_URL`
 
 ## 🔐 Encryption
 AWS access keys are encrypted before being written to the config file.
@@ -97,6 +104,7 @@ cannot be decrypted.
 ## 📝 Notes
 - `/download` streams to the browser. `/download-server` saves to `/tmp/<filename>` on the server host.
 - Credentials are stored locally on the server and are encrypted.
+- On first run, open `/register` to create a user and store AWS credentials.
 
 ## 🏗 Architecture Diagram
 

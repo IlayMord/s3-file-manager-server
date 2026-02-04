@@ -8,8 +8,15 @@ import time
 import os
 import sys
 import logging
+import secrets
+import hashlib
+import datetime
 import boto3, json
 from cryptography.fernet import Fernet
+sys.path.insert(0, os.path.dirname(__file__))
+import templates
+import psycopg2
+import psycopg2.extras
 
 def resolve_port():
     try:
@@ -39,6 +46,8 @@ CONFIG_ERROR = ""
 SECRET_FILE = os.path.join(CONFIG_DIR, "secret.key")
 LOG_DIR = os.path.join(CONFIG_DIR, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
+DB_URL = os.getenv("S3FM_DB_URL", "postgresql://postgres:postgres@localhost:5432/s3_file_manager")
+SESSION_DAYS = 7
 
 
 def setup_logging():
@@ -51,6 +60,179 @@ def setup_logging():
             logging.StreamHandler(sys.stdout),
         ],
     )
+
+def get_db_conn():
+    return psycopg2.connect(DB_URL)
+
+def init_auth_db():
+    for attempt in range(12):
+        try:
+            with get_db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS users (
+                          id SERIAL PRIMARY KEY,
+                          email TEXT UNIQUE NOT NULL,
+                          password_hash TEXT NOT NULL,
+                          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS sessions (
+                          id SERIAL PRIMARY KEY,
+                          token TEXT UNIQUE NOT NULL,
+                          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                          expires_at TIMESTAMPTZ NOT NULL
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS app_settings (
+                          id INTEGER PRIMARY KEY,
+                          bucket TEXT,
+                          aws_access_key TEXT,
+                          aws_secret_key TEXT,
+                          aws_region TEXT
+                        )
+                        """
+                    )
+            return
+        except Exception:
+            time.sleep(2)
+    raise RuntimeError("Failed to connect to Postgres for auth DB initialization.")
+
+def get_app_settings():
+    with get_db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT bucket, aws_access_key, aws_secret_key, aws_region
+                FROM app_settings
+                WHERE id = 1
+                """
+            )
+            return cur.fetchone()
+
+def upsert_app_settings(bucket=None, aws=None):
+    existing = get_app_settings() or {}
+    if bucket is None:
+        bucket = existing.get("bucket")
+    if aws is None:
+        aws_access_key = existing.get("aws_access_key")
+        aws_secret_key = existing.get("aws_secret_key")
+        aws_region = existing.get("aws_region")
+    else:
+        aws_access_key = aws.get("access_key")
+        aws_secret_key = aws.get("secret_key")
+        aws_region = aws.get("region")
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app_settings (id, bucket, aws_access_key, aws_secret_key, aws_region)
+                VALUES (1, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                  bucket = EXCLUDED.bucket,
+                  aws_access_key = EXCLUDED.aws_access_key,
+                  aws_secret_key = EXCLUDED.aws_secret_key,
+                  aws_region = EXCLUDED.aws_region
+                """,
+                (bucket, aws_access_key, aws_secret_key, aws_region),
+            )
+        conn.commit()
+
+def apply_db_settings():
+    global config, s3
+    settings = get_app_settings()
+    if not settings:
+        return
+    if settings.get("bucket"):
+        config["bucket"] = settings["bucket"]
+    if settings.get("aws_access_key") and settings.get("aws_secret_key") and settings.get("aws_region"):
+        config["aws"] = {
+            "access_key": settings["aws_access_key"],
+            "secret_key": settings["aws_secret_key"],
+            "region": settings["aws_region"],
+        }
+    s3 = build_s3(config) if config.get("aws") else None
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
+    return base64.b64encode(salt + digest).decode()
+
+def verify_password(password, stored):
+    try:
+        data = base64.b64decode(stored.encode())
+        salt = data[:16]
+        digest = data[16:]
+        check = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
+        return secrets.compare_digest(check, digest)
+    except Exception:
+        return False
+
+def parse_cookies(cookie_header):
+    cookies = {}
+    if not cookie_header:
+        return cookies
+    parts = cookie_header.split(";")
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            cookies[k.strip()] = v.strip()
+    return cookies
+
+def get_user_by_session(token):
+    if not token:
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with get_db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+            """
+            SELECT users.id, users.email, sessions.expires_at
+            FROM sessions JOIN users ON sessions.user_id = users.id
+            WHERE sessions.token = %s
+            """,
+            (token,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            if row["expires_at"] < now:
+                cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
+                conn.commit()
+                return None
+            return {"id": row["id"], "email": row["email"]}
+
+def create_session(user_id):
+    token = secrets.token_urlsafe(32)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expires = now + datetime.timedelta(days=SESSION_DAYS)
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+            """
+            INSERT INTO sessions (token, user_id, created_at, expires_at)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (token, user_id, now, expires),
+            )
+            conn.commit()
+    return token, expires
+
+def delete_session(token):
+    if not token:
+        return
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
+            conn.commit()
 
 
 # ENCRYPTION
@@ -156,1248 +338,15 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             return ""
 
     # ===== Polished CSS + Light/Dark mode =====
-    def css(self):
-        return """
-        <style>
-        :root {
-          --bg: #0b1117;
-          --bg-card: rgba(14, 20, 33, 0.92);
-          --bg-elevated: rgba(18, 26, 44, 0.9);
-          --border-subtle: rgba(148,163,184,0.2);
-          --accent: #2dd4bf;
-          --accent-2: #38bdf8;
-          --accent-strong: #0ea5e9;
-          --danger: #f97316;
-          --danger-soft: rgba(249,115,22,0.2);
-          --text: #e2e8f0;
-          --text-muted: #94a3b8;
-          --text-soft: #cbd5f5;
-          --success: #22c55e;
-          --shadow: 0 30px 70px rgba(2, 6, 23, 0.45);
-          --glow: 0 0 40px rgba(45, 212, 191, 0.2);
-        }
-        body[data-theme="light"] {
-          --bg: #f6f3ef;
-          --bg-card: rgba(255, 255, 255, 0.98);
-          --bg-elevated: #ffffff;
-          --border-subtle: rgba(15,23,42,0.12);
-          --accent: #0ea5e9;
-          --accent-2: #14b8a6;
-          --accent-strong: #0284c7;
-          --danger: #ea580c;
-          --danger-soft: rgba(234,88,12,0.12);
-          --text: #0f172a;
-          --text-muted: #64748b;
-          --text-soft: #334155;
-          --success: #16a34a;
-          --shadow: 0 20px 50px rgba(15, 23, 42, 0.18);
-          --glow: 0 0 40px rgba(14, 165, 233, 0.15);
-        }
-        body {
-          margin:0;
-          background:
-            radial-gradient(800px 500px at 12% -20%, rgba(45,212,191,0.2), transparent),
-            radial-gradient(700px 600px at 88% -10%, rgba(14,165,233,0.18), transparent),
-            linear-gradient(180deg, rgba(15,23,42,0.7), rgba(15,23,42,0)) 0 0 / 100% 45% no-repeat,
-            var(--bg);
-          color: var(--text);
-          font-family: "Bricolage Grotesque", "Space Grotesk", "IBM Plex Sans", sans-serif;
-          min-height: 100vh;
-        }
-        .bg-orb {
-          position: fixed;
-          width: 420px;
-          height: 420px;
-          border-radius: 50%;
-          filter: blur(60px);
-          opacity: 0.6;
-          z-index: 0;
-          pointer-events: none;
-        }
-        .orb-1 {
-          top: -160px;
-          left: -100px;
-          background: radial-gradient(circle, rgba(45,212,191,0.5), transparent 70%);
-        }
-        .orb-2 {
-          right: -120px;
-          top: 40px;
-          background: radial-gradient(circle, rgba(14,165,233,0.5), transparent 70%);
-        }
-        .orb-3 {
-          bottom: -180px;
-          left: 15%;
-          background: radial-gradient(circle, rgba(249,115,22,0.4), transparent 70%);
-        }
-        .page {
-          position: relative;
-          z-index: 1;
-        }
-        .top {
-          position: sticky;
-          top: 0;
-          z-index: 10;
-          background: rgba(10,15,25,0.7);
-          backdrop-filter: blur(12px);
-          border-bottom: 1px solid var(--border-subtle);
-          padding: 16px 26px;
-          font-size: 16px;
-          font-weight: 600;
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-        }
-        .top .right-actions {
-          display:flex;
-          gap:8px;
-          align-items:center;
-        }
-        .brand {
-          display:flex;
-          align-items:center;
-          gap:12px;
-        }
-        .brand-mark {
-          width:32px;
-          height:32px;
-          border-radius:10px;
-          background: linear-gradient(135deg, var(--accent), var(--accent-strong));
-          display:grid;
-          place-items:center;
-          color:#001018;
-          font-weight:700;
-        }
-        .chip {
-          font-size: 12px;
-          padding:4px 8px;
-          border-radius:999px;
-          border:1px solid var(--border-subtle);
-          background: rgba(15,23,42,0.45);
-        }
-        body[data-theme="light"] .chip {
-          background: #eef2ff;
-        }
-        .top button, .top a {
-          border-radius: 999px;
-          border: 1px solid var(--border-subtle);
-          padding: 7px 12px;
-          background: rgba(15,23,42,0.2);
-          color: var(--text-soft);
-          font-size: 13px;
-          cursor:pointer;
-          text-decoration:none;
-        }
-        .top a.danger {
-          border-color: var(--danger);
-          color: var(--danger);
-        }
-        .wrap {
-          max-width: 1200px;
-          margin: 26px auto;
-          padding: 0 12px 40px;
-          display: flex;
-          justify-content: center;
-        }
-        .card {
-          background: var(--bg-card);
-          border-radius: 18px;
-          border: 1px solid var(--border-subtle);
-          padding: 24px 24px 26px;
-          box-shadow: var(--shadow);
-          animation: floatUp .35s ease both;
-          width: 100%;
-          max-width: 1100px;
-        }
-        .section-title {
-          margin: 18px 0 10px;
-          font-size: 13px;
-          letter-spacing: 0.08em;
-          text-transform: uppercase;
-          color: var(--text-muted);
-        }
-        h2 {
-          margin-top:0;
-          font-size:22px;
-          letter-spacing: -0.01em;
-        }
-        .subtitle {
-          font-size: 13px;
-          color: var(--text-muted);
-          margin-bottom: 18px;
-        }
-        .stat-grid {
-          display:grid;
-          grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-          gap:12px;
-          margin: 12px 0 18px;
-        }
-        .stat-card {
-          padding: 14px 16px;
-          border-radius: 16px;
-          background: var(--bg-elevated);
-          border: 1px solid var(--border-subtle);
-          box-shadow: var(--glow);
-        }
-        .stat-card .label {
-          font-size: 11px;
-          text-transform: uppercase;
-          letter-spacing: 0.08em;
-          color: var(--text-muted);
-        }
-        .stat-card .value {
-          font-size: 18px;
-          font-weight: 600;
-          margin-top: 6px;
-        }
-        .stat-card .meta {
-          font-size: 12px;
-          color: var(--text-muted);
-          margin-top: 4px;
-        }
-        .pill-row {
-          display:flex;
-          flex-wrap:wrap;
-          gap:10px;
-          margin: 4px 0 16px;
-        }
-        .pill {
-          display:inline-flex;
-          align-items:center;
-          gap:8px;
-          border-radius:999px;
-          padding:6px 12px;
-          border:1px solid var(--border-subtle);
-          background: rgba(15,23,42,0.35);
-          font-size:12px;
-          color: var(--text-soft);
-        }
-        body[data-theme="light"] .pill {
-          background: #f8fafc;
-        }
-        .input {
-          width:100%;
-          padding: 10px 11px;
-          border-radius: 10px;
-          border:1px solid var(--border-subtle);
-          background: transparent;
-          color: var(--text);
-          font-size: 14px;
-        }
-        .input::placeholder {
-          color: var(--text-muted);
-        }
-        .input:focus {
-          outline:none;
-          border-color: var(--accent-2);
-          box-shadow: 0 0 0 2px rgba(34,211,238,0.25);
-        }
-        .input:focus-visible,
-        .btn:focus-visible,
-        a:focus-visible {
-          outline: 2px solid rgba(34,211,238,0.5);
-          outline-offset: 2px;
-        }
-        .btn {
-          padding: 8px 14px;
-          border-radius: 10px;
-          border:0;
-          background: linear-gradient(135deg, var(--accent), var(--accent-strong));
-          color:#001018;
-          font-weight:600;
-          cursor:pointer;
-          font-size:14px;
-        }
-        .btn.secondary {
-          background: transparent;
-          border:1px solid var(--border-subtle);
-          color: var(--text-soft);
-        }
-        .btn.danger {
-          background: var(--danger);
-        }
-        .btn.ghost {
-          background: transparent;
-          border:1px solid var(--border-subtle);
-          color: var(--text);
-        }
-        .btn.ghost.active {
-          border-color: var(--accent-2);
-          box-shadow: 0 0 0 2px rgba(56,189,248,0.15);
-          color: var(--text);
-        }
-        .btn.warn {
-          background: linear-gradient(135deg, #fb923c, #f97316);
-          color: #1f1306;
-        }
-        table {
-          width:100%;
-          border-collapse: collapse;
-          margin-top: 14px;
-        }
-        th, td {
-          padding: 12px 6px;
-          border-bottom: 1px solid var(--border-subtle);
-          font-size: 13px;
-        }
-        tbody tr:hover {
-          background: rgba(14,165,233,0.08);
-        }
-        th {
-          color: var(--text-soft);
-          text-transform: uppercase;
-          letter-spacing: 0.05em;
-          font-size: 11px;
-        }
-        th.col-select, td.col-select {
-          width: 28px;
-          text-align: center;
-        }
-        td.size {
-          color: var(--text-muted);
-          white-space: nowrap;
-        }
-        td.meta {
-          color: var(--text-muted);
-          white-space: nowrap;
-        }
-        td.actions {
-          text-align:right;
-          white-space: nowrap;
-        }
-        .link {
-          font-size: 13px;
-          color: var(--accent-2);
-          text-decoration:none;
-          margin-left: 8px;
-        }
-        .link.danger {
-          color: var(--danger);
-        }
-        .tag-folder {
-          display:inline-flex;
-          align-items:center;
-          gap:6px;
-        }
-        .folder-icon {
-          width:16px;height:12px;
-          border-radius:3px;
-          background: linear-gradient(135deg,#fbbf24,#f97316);
-        }
-        .file-icon {
-          width: 18px;
-          height: 18px;
-          border-radius: 6px;
-          background: linear-gradient(135deg, rgba(14,165,233,0.9), rgba(45,212,191,0.9));
-          display: inline-block;
-          margin-right: 8px;
-          vertical-align: middle;
-        }
-        body[data-theme="dark"] .folder-icon {
-          background: linear-gradient(135deg,#facc15,#f97316);
-        }
-        .muted {
-          color: var(--text-muted);
-        }
-        .upload-row {
-          display:flex;
-          flex-wrap:wrap;
-          gap:10px;
-          align-items:center;
-          justify-content:space-between;
-          margin-top: 18px;
-        }
-        .uploadbox {
-          border-radius: 14px;
-          border:1px dashed var(--border-subtle);
-          padding: 14px 16px;
-          background: rgba(15,23,42,0.55);
-          margin-top: 18px;
-        }
-        body[data-theme="light"] .uploadbox {
-          background: #f9fafb;
-        }
-        .folder-form {
-          margin-top:18px;
-          display:flex;
-          gap:8px;
-          flex-wrap:wrap;
-          align-items:center;
-        }
-        .search-row {
-          display:flex;
-          justify-content:space-between;
-          align-items:center;
-          gap:12px;
-          margin-top: 8px;
-        }
-        .search-row .search {
-          flex:1;
-        }
-        .badge-prefix {
-          font-size:12px;
-          color: var(--text-soft);
-        }
-        .breadcrumbs {
-          display:flex;
-          flex-wrap:wrap;
-          gap:8px;
-          font-size: 12px;
-          margin: 6px 0 14px;
-        }
-        .crumb {
-          padding:4px 8px;
-          border-radius:999px;
-          border:1px solid var(--border-subtle);
-          color: var(--text-soft);
-          text-decoration:none;
-          background: rgba(15,23,42,0.35);
-        }
-        .crumb.current {
-          color: var(--text);
-          border-color: rgba(56,189,248,0.5);
-        }
-        .toolbar {
-          display:flex;
-          justify-content:space-between;
-          align-items:center;
-          flex-wrap:wrap;
-          gap:12px;
-          margin-top: 8px;
-        }
-        .toolbar-group {
-          display:flex;
-          align-items:center;
-          gap:10px;
-          flex-wrap:wrap;
-        }
-        .toolbar form {
-          display:flex;
-          align-items:center;
-          gap:8px;
-          flex-wrap:wrap;
-        }
-        .toolbar .left, .toolbar .right {
-          display:flex;
-          align-items:center;
-          gap:10px;
-          flex-wrap:wrap;
-        }
-        select.input {
-          background: var(--bg-elevated);
-          color: var(--text);
-        }
-        select.input option {
-          background: var(--bg-elevated);
-          color: var(--text);
-        }
-        body[data-theme="light"] select.input option {
-          background: #ffffff;
-          color: #0f172a;
-        }
-        .view-toggle {
-          display:flex;
-          gap:6px;
-        }
-        .auth-form {
-          display:flex;
-          flex-direction:column;
-          gap:12px;
-        }
-        .auth-form .btn {
-          align-self:center;
-        }
-        .progress-wrap {
-          margin-top: 10px;
-        }
-        .progress-bar {
-          width:100%;
-          height:8px;
-          border-radius:999px;
-          background: rgba(15,23,42,0.8);
-          overflow:hidden;
-        }
-        body[data-theme="light"] .progress-bar {
-          background:#e5e7eb;
-        }
-        .progress-fill {
-          height:100%;
-          width:0%;
-          background: linear-gradient(90deg,#22c55e,#16a34a);
-          transition: width .15s linear;
-        }
-        .progress-text {
-          font-size:12px;
-          margin-top:4px;
-          color: var(--text-muted);
-        }
-        .empty {
-          text-align:center;
-          padding: 32px 0;
-          color: var(--text-muted);
-          font-size: 14px;
-        }
-        .status-dot {
-          width:8px;
-          height:8px;
-          border-radius:999px;
-          background: var(--success);
-          display:inline-block;
-        }
-        .action-link {
-          font-size: 12px;
-          color: var(--text-soft);
-          text-decoration:none;
-          border:1px solid var(--border-subtle);
-          padding:4px 8px;
-          border-radius:999px;
-          margin-left:6px;
-        }
-        .table-scroll {
-          overflow-x: auto;
-        }
-        .checkbox {
-          width: 16px;
-          height: 16px;
-          accent-color: var(--accent-2);
-        }
-        .bulk-bar {
-          display:flex;
-          flex-wrap:wrap;
-          gap:10px;
-          align-items:center;
-          margin-top: 12px;
-          padding: 10px 12px;
-          border-radius: 12px;
-          border: 1px solid var(--border-subtle);
-          background: rgba(15,23,42,0.35);
-        }
-        .bulk-bar.hidden {
-          display:none;
-        }
-        body[data-theme="light"] .bulk-bar {
-          background: #f8fafc;
-        }
-        .bulk-input {
-          max-width: 220px;
-        }
-        .mono {
-          font-family: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-        }
-        .pager {
-          display:flex;
-          justify-content:flex-end;
-          gap:8px;
-          margin-top: 14px;
-        }
-        .preview-wrap {
-          max-width: 900px;
-          margin: 40px auto;
-          padding: 0 16px 40px;
-        }
-        .preview-card {
-          background: var(--bg-card);
-          border-radius: 18px;
-          border: 1px solid var(--border-subtle);
-          padding: 20px;
-          box-shadow: var(--shadow);
-        }
-        .preview-header {
-          display:flex;
-          align-items:center;
-          justify-content:space-between;
-          gap:12px;
-          margin-bottom: 16px;
-        }
-        .preview-frame {
-          width:100%;
-          border-radius: 14px;
-          border: 1px solid var(--border-subtle);
-          background: rgba(15,23,42,0.2);
-          padding: 12px;
-          word-break: break-all;
-          overflow-wrap: anywhere;
-        }
-        .share-box {
-          background: linear-gradient(135deg, rgba(14,165,233,0.12), rgba(45,212,191,0.12));
-          border: 1px solid rgba(56,189,248,0.35);
-          color: var(--text);
-          font-size: 12px;
-          line-height: 1.5;
-          min-height: 88px;
-          display: flex;
-          align-items: center;
-          white-space: normal;
-          overflow-wrap: anywhere;
-          word-break: break-word;
-          overflow: auto;
-        }
-        .dropzone {
-          display:flex;
-          align-items:center;
-          justify-content:space-between;
-          gap:16px;
-          padding: 12px 14px;
-          border-radius: 12px;
-          border: 1px dashed var(--border-subtle);
-          background: rgba(15,23,42,0.3);
-          transition: border-color .2s ease, background .2s ease, transform .2s ease;
-        }
-        body[data-theme="light"] .dropzone {
-          background: #f8fafc;
-        }
-        .dropzone.active {
-          border-color: var(--accent-2);
-          background: rgba(45,212,191,0.08);
-          transform: translateY(-1px);
-        }
-        .dropzone input[type="file"] {
-          color: var(--text);
-        }
-        .grid {
-          display:none;
-          grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-          gap:16px;
-          margin-top: 18px;
-        }
-        .grid-item {
-          border-radius: 16px;
-          padding: 14px 16px;
-          border: 1px solid var(--border-subtle);
-          background: var(--bg-elevated);
-          box-shadow: 0 12px 24px rgba(2,6,23,0.2);
-          display:flex;
-          flex-direction:column;
-          gap:10px;
-        }
-        .grid-head {
-          display:flex;
-          align-items:center;
-          gap:10px;
-        }
-        .grid-title {
-          font-weight:600;
-          font-size:14px;
-          word-break: break-word;
-        }
-        .grid-meta {
-          display:flex;
-          flex-wrap:wrap;
-          gap:8px;
-          font-size:12px;
-          color: var(--text-muted);
-        }
-        .meta-pill {
-          padding: 4px 8px;
-          border-radius: 999px;
-          border: 1px solid var(--border-subtle);
-          color: var(--text-soft);
-          font-size: 11px;
-        }
-        .grid-actions {
-          margin-top: auto;
-          display:flex;
-          flex-wrap:wrap;
-          gap:6px;
-        }
-        .toast {
-          position: fixed;
-          bottom: 22px;
-          right: 22px;
-          background: rgba(15,23,42,0.9);
-          color: var(--text);
-          padding: 10px 14px;
-          border-radius: 12px;
-          border: 1px solid var(--border-subtle);
-          font-size: 12px;
-          box-shadow: var(--shadow);
-          opacity: 0;
-          transform: translateY(8px);
-          transition: opacity .2s ease, transform .2s ease;
-          pointer-events: none;
-          z-index: 20;
-        }
-        .toast.show {
-          opacity: 1;
-          transform: translateY(0);
-        }
-        .modal-backdrop {
-          position: fixed;
-          inset: 0;
-          background: rgba(2, 6, 23, 0.6);
-          display: none;
-          align-items: center;
-          justify-content: center;
-          z-index: 30;
-          padding: 16px;
-        }
-        .modal {
-          width: 100%;
-          max-width: 420px;
-          border-radius: 16px;
-          border: 1px solid var(--border-subtle);
-          background: var(--bg-card);
-          box-shadow: var(--shadow);
-          padding: 18px;
-        }
-        .modal h3 {
-          margin: 0 0 8px;
-          font-size: 16px;
-        }
-        .modal p {
-          margin: 0 0 14px;
-          color: var(--text-muted);
-          font-size: 13px;
-        }
-        .modal-actions {
-          display: flex;
-          justify-content: flex-end;
-          gap: 8px;
-        }
-        .modal-backdrop.show {
-          display: flex;
-        }
-        .modal input {
-          width: 100%;
-          margin: 8px 0 12px;
-          padding: 10px 11px;
-          border-radius: 10px;
-          border: 1px solid var(--border-subtle);
-          background: transparent;
-          color: var(--text);
-          font-size: 14px;
-        }
-        .is-hidden {
-          display:none !important;
-        }
-        body[data-view="grid"] .table-scroll {
-          display:none;
-        }
-        body[data-view="grid"] .grid {
-          display:grid;
-        }
-        @keyframes floatUp {
-          from { opacity: 0; transform: translateY(10px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-        @media (max-width: 820px) {
-          .top {
-            flex-direction: column;
-            align-items:flex-start;
-            gap: 12px;
-          }
-          .top .right-actions {
-            flex-wrap: wrap;
-          }
-          .card {
-            padding: 18px;
-          }
-          th:nth-child(4), td:nth-child(4),
-          th:nth-child(5), td:nth-child(5) {
-            display:none;
-          }
-          .grid {
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-          }
-        }
-        </style>
-        """
-
-    def fonts(self):
-        return """
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-        """
-
     def render_bucket_form(self, error=""):
-        error_html = f"<div class='subtitle' style='color: var(--danger);'>{error}</div>" if error else ""
-        return f"""
-        <html><head>{self.fonts()}{self.css()}{self.scripts()}</head>
-        <body data-theme="dark">
-          <div class='bg-orb orb-1'></div>
-          <div class='bg-orb orb-2'></div>
-          <div class='bg-orb orb-3'></div>
-          <div class='page'>
-          <div class='wrap'>
-            <div class='card' style='max-width:480px;margin-top:40px'>
-              <h2>Connect a Bucket</h2>
-              <div class='subtitle'>Enter the S3 bucket name to manage files.</div>
-              {error_html}
-              <form class='auth-form' method='post' action='/save-bucket'>
-                <input class='input' name='bucket' placeholder='bucket-name'>
-                <button class='btn'>Continue</button>
-              </form>
-            </div>
-          </div>
-          </div>
-        </body></html>
-        """
+        error_html = f"<div class='subtitle error'>{error}</div>" if error else ""
+        return templates.render_bucket_form(error_html)
 
     def render_creds_form(self, error=""):
-        error_html = f"<div class='subtitle' style='color: var(--danger);'>{error}</div>" if error else ""
-        return f"""
-        <html><head>{self.fonts()}{self.css()}{self.scripts()}</head>
-        <body data-theme="dark">
-          <div class='bg-orb orb-1'></div>
-          <div class='bg-orb orb-2'></div>
-          <div class='bg-orb orb-3'></div>
-          <div class='page'>
-          <div class='wrap'>
-            <div class='card' style='max-width:480px;margin-top:40px'>
-              <h2>AWS Credentials</h2>
-              <div class='subtitle'>Access key is stored locally on this server only.</div>
-              {error_html}
-              <form class='auth-form' method='post' action='/save-creds'>
-                <input class='input' name='access_key' placeholder='Access Key'>
-                <input class='input' name='secret_key' placeholder='Secret Key'>
-                <input class='input' name='region' value='us-east-1'>
-                <button class='btn'>Save</button>
-              </form>
-            </div>
-          </div>
-          </div>
-        </body></html>
-        """
+        error_html = f"<div class='subtitle error'>{error}</div>" if error else ""
+        return templates.render_creds_form(error_html)
 
     # ===== JavaScript: theme toggling, search, and upload progress =====
-    def scripts(self):
-        return """
-        <script>
-        function applyTheme() {
-          var saved = localStorage.getItem('s3mgr-theme') || 'dark';
-          document.body.setAttribute('data-theme', saved);
-        }
-        function applyView() {
-          var saved = localStorage.getItem('s3mgr-view') || 'table';
-          document.body.setAttribute('data-view', saved);
-          var tableBtn = document.getElementById('viewTable');
-          var gridBtn = document.getElementById('viewGrid');
-          if (tableBtn && gridBtn) {
-            tableBtn.classList.toggle('active', saved === 'table');
-            gridBtn.classList.toggle('active', saved === 'grid');
-          }
-        }
-        function toggleTheme() {
-          var cur = document.body.getAttribute('data-theme') || 'dark';
-          var next = cur === 'dark' ? 'light' : 'dark';
-          document.body.setAttribute('data-theme', next);
-          localStorage.setItem('s3mgr-theme', next);
-        }
-        function toggleView(view) {
-          document.body.setAttribute('data-view', view);
-          localStorage.setItem('s3mgr-view', view);
-          applyView();
-        }
-        function applyFilters() {
-          var box = document.getElementById('searchBox');
-          var filter = document.getElementById('typeFilter');
-          var q = box ? box.value.toLowerCase() : '';
-          var kind = filter ? filter.value : 'all';
-          var rows = document.querySelectorAll('#fileTable tbody tr[data-kind]');
-          var cards = document.querySelectorAll('.grid-item[data-kind]');
-          function match(el) {
-            var name = (el.getAttribute('data-name') || '').toLowerCase();
-            var kindMatches = kind === 'all' || el.getAttribute('data-kind') === kind;
-            var textMatches = !q || name.indexOf(q) !== -1;
-            el.classList.toggle('is-hidden', !(kindMatches && textMatches));
-          }
-          rows.forEach(match);
-          cards.forEach(match);
-        }
-        function initSearch() {
-          var box = document.getElementById('searchBox');
-          var filter = document.getElementById('typeFilter');
-          if (!box) return;
-          box.addEventListener('input', applyFilters);
-          if (filter) {
-            filter.addEventListener('change', applyFilters);
-          }
-        }
-        function initSort() {
-          var select = document.getElementById('sortSelect');
-          if (!select) return;
-          select.addEventListener('change', function() {
-            var mode = select.value;
-            var tbody = document.querySelector('#fileTable tbody');
-            var grid = document.getElementById('gridItems');
-            if (!tbody) return;
-            var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-kind]'));
-            var cards = Array.prototype.slice.call(document.querySelectorAll('.grid-item[data-kind]'));
-            rows.sort(function(a, b) {
-              if (mode === 'name') {
-                return (a.dataset.name || '').localeCompare(b.dataset.name || '');
-              }
-              if (mode === 'size') {
-                return (parseInt(b.dataset.size || '0', 10) - parseInt(a.dataset.size || '0', 10));
-              }
-              if (mode === 'modified') {
-                return (b.dataset.date || '').localeCompare(a.dataset.date || '');
-              }
-              return 0;
-            });
-            rows.forEach(function(r) { tbody.appendChild(r); });
-            if (grid) {
-              cards.sort(function(a, b) {
-                if (mode === 'name') {
-                  return (a.dataset.name || '').localeCompare(b.dataset.name || '');
-                }
-                if (mode === 'size') {
-                  return (parseInt(b.dataset.size || '0', 10) - parseInt(a.dataset.size || '0', 10));
-                }
-                if (mode === 'modified') {
-                  return (b.dataset.date || '').localeCompare(a.dataset.date || '');
-                }
-                return 0;
-              });
-              cards.forEach(function(c) { grid.appendChild(c); });
-            }
-          });
-        }
-        function showToast(message) {
-          var toast = document.getElementById('toast');
-          if (!toast) return;
-          toast.textContent = message;
-          toast.classList.add('show');
-          setTimeout(function() { toast.classList.remove('show'); }, 1400);
-        }
-        function openModal(opts) {
-          var modal = document.getElementById('confirmModal');
-          if (!modal) return;
-          var titleEl = document.getElementById('confirmTitle');
-          var msgEl = document.getElementById('confirmMessage');
-          var okBtn = document.getElementById('confirmOk');
-          var cancelBtn = document.getElementById('confirmCancel');
-          var input = document.getElementById('confirmInput');
-          if (titleEl) titleEl.textContent = opts.title || 'Confirm';
-          if (msgEl) msgEl.textContent = opts.message || '';
-          if (okBtn) okBtn.textContent = opts.okText || 'OK';
-          if (cancelBtn) cancelBtn.textContent = opts.cancelText || 'Cancel';
-          if (input) {
-            input.value = opts.inputValue || '';
-            input.placeholder = opts.inputPlaceholder || '';
-            input.classList.toggle('is-hidden', !opts.showInput);
-            input.readOnly = !!opts.readOnly;
-          }
-          function close() {
-            modal.classList.remove('show');
-            okBtn.removeEventListener('click', okHandler);
-            cancelBtn.removeEventListener('click', close);
-            modal.removeEventListener('click', backdropClose);
-          }
-          function okHandler() {
-            var value = input ? input.value : '';
-            close();
-            if (opts.onConfirm) opts.onConfirm(value);
-          }
-          function backdropClose(e) {
-            if (e.target === modal) close();
-          }
-          okBtn.addEventListener('click', okHandler);
-          cancelBtn.addEventListener('click', close);
-          modal.addEventListener('click', backdropClose);
-          modal.classList.add('show');
-          if (input && opts.showInput) {
-            setTimeout(function() { input.focus(); input.select(); }, 50);
-          }
-        }
-        function showConfirm(title, message, onConfirm) {
-          openModal({ title: title, message: message, okText: 'Delete', onConfirm: onConfirm });
-        }
-        function showAlert(title, message) {
-          openModal({ title: title, message: message, okText: 'OK', cancelText: 'Close' });
-        }
-        function showPrompt(title, message, defaultValue, onConfirm) {
-          openModal({
-            title: title,
-            message: message,
-            okText: 'Save',
-            showInput: true,
-            inputValue: defaultValue || '',
-            onConfirm: onConfirm
-          });
-        }
-        function showCopyFallback(text) {
-          openModal({
-            title: 'Copy URL',
-            message: 'Copy the link below:',
-            okText: 'Done',
-            cancelText: 'Close',
-            showInput: true,
-            inputValue: text || '',
-            readOnly: true
-          });
-        }
-        function initCopyButtons() {
-          var buttons = document.querySelectorAll('[data-copy]');
-          buttons.forEach(function(btn) {
-            btn.addEventListener('click', function(e) {
-              e.preventDefault();
-              var val = btn.getAttribute('data-copy');
-              if (!val) return;
-              if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(val);
-                showToast('Copied to clipboard');
-              } else {
-                showCopyFallback(val);
-              }
-            });
-          });
-        }
-        function initDropzone() {
-          var zone = document.getElementById('dropzone');
-          var fileInput = document.getElementById('fileInput');
-          var fileLabel = document.getElementById('fileCount');
-          if (!zone || !fileInput) return;
-          ['dragenter','dragover'].forEach(function(evt) {
-            zone.addEventListener(evt, function(e) {
-              e.preventDefault();
-              zone.classList.add('active');
-            });
-          });
-          ['dragleave','drop'].forEach(function(evt) {
-            zone.addEventListener(evt, function(e) {
-              e.preventDefault();
-              zone.classList.remove('active');
-            });
-          });
-          zone.addEventListener('drop', function(e) {
-            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-              fileInput.files = e.dataTransfer.files;
-              if (fileLabel) {
-                fileLabel.textContent = e.dataTransfer.files.length + ' files selected';
-              }
-            }
-          });
-        }
-        function initUpload() {
-          var form = document.getElementById('uploadForm');
-          if (!form) return;
-          var bar = document.getElementById('progressFill');
-          var wrap = document.getElementById('progressWrap');
-          var txt = document.getElementById('progressText');
-          var fileLabel = document.getElementById('fileCount');
-          form.addEventListener('submit', function(e) {
-            e.preventDefault();
-            var fileInput = document.getElementById('fileInput');
-            if (!fileInput || !fileInput.files.length) {
-              showAlert('Upload', 'Choose a file first');
-              return;
-            }
-            wrap.style.display = 'block';
-            bar.style.width = '0%';
-            txt.textContent = '0%';
-
-            var xhr = new XMLHttpRequest();
-            xhr.open('POST', form.getAttribute('action') || '/', true);
-
-            xhr.upload.onprogress = function(ev) {
-              if (ev.lengthComputable) {
-                var p = Math.round((ev.loaded / ev.total) * 100);
-                bar.style.width = p + '%';
-                txt.textContent = p + '%';
-              }
-            };
-            xhr.onload = function() {
-              if (xhr.status === 200) {
-                txt.textContent = 'Done';
-                setTimeout(function(){ window.location.reload(); }, 500);
-              } else {
-                txt.textContent = (xhr.responseText && xhr.responseText.trim()) ? xhr.responseText : ('Error ' + xhr.status);
-              }
-            };
-            xhr.onerror = function() {
-              txt.textContent = 'Upload failed';
-            };
-
-            var fd = new FormData(form);
-            xhr.send(fd);
-          });
-          var fileInput = document.getElementById('fileInput');
-          if (fileInput && fileLabel) {
-            fileInput.addEventListener('change', function() {
-              var count = fileInput.files ? fileInput.files.length : 0;
-              fileLabel.textContent = count ? (count + ' files selected') : 'No files selected';
-            });
-          }
-        }
-        function getSelectedKeys() {
-          var boxes = document.querySelectorAll('.row-select:checked');
-          var keys = [];
-          boxes.forEach(function(box) {
-            var key = box.getAttribute('data-key');
-            if (key && keys.indexOf(key) === -1) {
-              keys.push(key);
-            }
-          });
-          return keys;
-        }
-        function syncCheckboxes(key, checked) {
-          var boxes = document.querySelectorAll('.row-select');
-          boxes.forEach(function(box) {
-            if (box.getAttribute('data-key') === key) {
-              box.checked = checked;
-            }
-          });
-        }
-        function updateSelectionCount() {
-          var label = document.getElementById('selectedCount');
-          var bar = document.getElementById('bulkBar');
-          if (!label) return;
-          var keys = getSelectedKeys();
-          label.textContent = keys.length + ' selected';
-          if (bar) {
-            bar.classList.toggle('hidden', keys.length === 0);
-          }
-        }
-        function initSelection() {
-          var boxes = document.querySelectorAll('.row-select');
-          boxes.forEach(function(box) {
-            box.addEventListener('change', function() {
-              var key = box.getAttribute('data-key');
-              syncCheckboxes(key, box.checked);
-              updateSelectionCount();
-            });
-          });
-          var selectAll = document.getElementById('selectAll');
-          if (selectAll) {
-            selectAll.addEventListener('change', function() {
-              var rows = document.querySelectorAll('.row-select');
-              rows.forEach(function(box) {
-                var container = box.closest('.is-hidden');
-                if (!container) {
-                  box.checked = selectAll.checked;
-                }
-              });
-              updateSelectionCount();
-            });
-          }
-          updateSelectionCount();
-        }
-        function submitBulk(action) {
-          var keys = getSelectedKeys();
-          if (!keys.length) {
-            showAlert('Bulk action', 'Select files or folders first');
-            return;
-          }
-          if (action === 'delete') {
-            showConfirm('Delete selected', 'Delete all selected items? This cannot be undone.', function() {
-              proceedBulk(action, keys, form, target, targetHidden);
-            });
-            return;
-          }
-          var form = document.getElementById('bulkForm');
-          var target = document.getElementById('bulkTarget');
-          var targetHidden = document.getElementById('bulkTargetHidden');
-          if (!form) return;
-          proceedBulk(action, keys, form, target, targetHidden);
-        }
-        function proceedBulk(action, keys, form, target, targetHidden) {
-          if (!form) return;
-          form.querySelectorAll('input[name="keys"]').forEach(function(el) { el.remove(); });
-          keys.forEach(function(k) {
-            var input = document.createElement('input');
-            input.type = 'hidden';
-            input.name = 'keys';
-            input.value = k;
-            form.appendChild(input);
-          });
-          var actionInput = document.getElementById('bulkAction');
-          if (actionInput) actionInput.value = action;
-          if ((action === 'move' || action === 'copy') && (!target || !target.value)) {
-            showAlert('Bulk action', 'Enter a target prefix');
-            return;
-          }
-          if (targetHidden) {
-            targetHidden.value = target && target.value ? target.value : '';
-          }
-          form.submit();
-        }
-        function initBulkActions() {
-          var deleteBtn = document.getElementById('bulkDelete');
-          var moveBtn = document.getElementById('bulkMove');
-          var copyBtn = document.getElementById('bulkCopy');
-          if (deleteBtn) {
-            deleteBtn.addEventListener('click', function(e) {
-              e.preventDefault();
-              showConfirm('Delete selected', 'Delete all selected items? This cannot be undone.', function() {
-                submitBulk('delete');
-              });
-            });
-          }
-          if (moveBtn) moveBtn.addEventListener('click', function(e) { e.preventDefault(); submitBulk('move'); });
-          if (copyBtn) copyBtn.addEventListener('click', function(e) { e.preventDefault(); submitBulk('copy'); });
-        }
-        function initDeleteLinks() {
-          var links = document.querySelectorAll('[data-delete-url]');
-          links.forEach(function(link) {
-            link.addEventListener('click', function(e) {
-              e.preventDefault();
-              var url = link.getAttribute('data-delete-url');
-              if (!url) return;
-              showConfirm('Delete item', 'Delete this item? This cannot be undone.', function() {
-                window.location.href = url;
-              });
-            });
-          });
-        }
-        function initRename() {
-          var renames = document.querySelectorAll('[data-rename]');
-          renames.forEach(function(btn) {
-            btn.addEventListener('click', function(e) {
-              e.preventDefault();
-              var key = btn.getAttribute('data-rename');
-              var current = btn.getAttribute('data-name') || key;
-              showPrompt('Rename item', 'Enter the new name', current, function(next) {
-                if (!next || next === current) return;
-                var form = document.getElementById('renameForm');
-                if (!form) return;
-                form.querySelector('input[name="old"]').value = key;
-                form.querySelector('input[name="new"]').value = next;
-                form.submit();
-              });
-            });
-          });
-        }
-        document.addEventListener('DOMContentLoaded', function() {
-          applyTheme();
-          applyView();
-          var themeBtn = document.getElementById('themeToggle');
-          if (themeBtn) {
-            themeBtn.addEventListener('click', function(e) {
-              e.preventDefault();
-              toggleTheme();
-            });
-          }
-          var tableBtn = document.getElementById('viewTable');
-          var gridBtn = document.getElementById('viewGrid');
-          if (tableBtn && gridBtn) {
-            tableBtn.addEventListener('click', function(e) {
-              e.preventDefault();
-              toggleView('table');
-            });
-            gridBtn.addEventListener('click', function(e) {
-              e.preventDefault();
-              toggleView('grid');
-            });
-          }
-          var refresh = document.getElementById('lastRefresh');
-          if (refresh) {
-            refresh.textContent = new Date().toLocaleTimeString();
-          }
-          initSearch();
-          applyFilters();
-          initUpload();
-          initSort();
-          initCopyButtons();
-          initDropzone();
-          initSelection();
-          initBulkActions();
-          initRename();
-          initDeleteLinks();
-        });
-        </script>
-        """
-
     def respond(self, html):
         self.send_response(200)
         self.send_header("Content-Type","text/html; charset=utf-8")
@@ -1409,6 +358,41 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.end_headers()
         self.wfile.write(text.encode("utf-8"))
+
+    def current_user(self):
+        cookies = parse_cookies(self.headers.get("Cookie", ""))
+        token = cookies.get("s3fm_session")
+        return get_user_by_session(token)
+
+    def require_auth(self):
+        public = {"/login", "/register"}
+        path = urllib.parse.urlparse(self.path).path
+        if path in public:
+            return True
+        user = self.current_user()
+        if user:
+            return True
+        self.send_response(302)
+        self.send_header("Location", "/login")
+        self.end_headers()
+        return False
+
+    def serve_static(self, path):
+        static_root = os.path.join(os.path.dirname(__file__), "static")
+        rel = path[len("/static/"):]
+        rel = os.path.normpath(rel).lstrip(os.sep)
+        static_root_abs = os.path.abspath(static_root)
+        file_path = os.path.abspath(os.path.join(static_root, rel))
+        if not (file_path == static_root_abs or file_path.startswith(static_root_abs + os.sep)):
+            return self.respond_text(404, "Not found")
+        if not os.path.isfile(file_path):
+            return self.respond_text(404, "Not found")
+        content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.end_headers()
+        with open(file_path, "rb") as handle:
+            self.wfile.write(handle.read())
 
 
     def presign_url(self, key, expires=900):
@@ -1470,6 +454,65 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
     # GET
     def do_GET(self):
         global config, s3
+        p = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(p.query)
+
+        if p.path.startswith("/static/"):
+            return self.serve_static(p.path)
+
+        if not self.require_auth():
+            return
+
+        if p.path == "/login":
+            error_html = ""
+            fields = [
+                "<input class='input' name='email' placeholder='Email' type='email' required>",
+                "<input class='input' name='password' placeholder='Password' type='password' required>",
+            ]
+            switch_html = "No account? <a class='link' href='/register'>Create one</a>"
+            return self.respond(templates.render_auth_form(
+                "Sign in", "Welcome back. Access your S3 workspace.", "/login", fields, error_html, switch_html
+            ))
+
+        if p.path == "/register":
+            error_html = ""
+            fields = [
+                "<input class='input' name='email' placeholder='Email' type='email' required>",
+                "<input class='input' name='password' placeholder='Password' type='password' required>",
+                "<input class='input' name='password_confirm' placeholder='Confirm password' type='password' required>",
+                "<input class='input' name='access_key' placeholder='AWS Access Key' required>",
+                "<input class='input' name='secret_key' placeholder='AWS Secret Key' required>",
+                "<input class='input' name='region' value='us-east-1' required>",
+            ]
+            switch_html = "Already have an account? <a class='link' href='/login'>Sign in</a>"
+            return self.respond(templates.render_auth_form(
+                "Create account", "Create your account and save AWS credentials once.", "/register", fields, error_html, switch_html
+            ))
+
+        if p.path == "/logout":
+            cookies = parse_cookies(self.headers.get("Cookie", ""))
+            token = cookies.get("s3fm_session")
+            delete_session(token)
+            self.send_response(302)
+            self.send_header("Set-Cookie", "s3fm_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+
+        if p.path == "/change-password":
+            if not self.require_auth():
+                return
+            error_html = ""
+            fields = [
+                "<input class='input' name='current_password' placeholder='Current password' type='password' required>",
+                "<input class='input' name='new_password' placeholder='New password' type='password' required>",
+                "<input class='input' name='confirm_password' placeholder='Confirm new password' type='password' required>",
+            ]
+            switch_html = "Back to files? <a class='link' href='/'>Go to manager</a>"
+            return self.respond(templates.render_auth_form(
+                "Change password", "Update your account password.", "/change-password", fields, error_html, switch_html
+            ))
+
         # No bucket has been configured yet
         if not config.get("bucket"):
             return self.respond(self.render_bucket_form())
@@ -1478,8 +521,6 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         if not config.get("aws") or not s3:
             return self.respond(self.render_creds_form())
 
-        p = urllib.parse.urlparse(self.path)
-        q = urllib.parse.parse_qs(p.query)
         prefix = q.get("prefix", [""])[0]
         token = q.get("token", [""])[0]
         query = q.get("q", [""])[0].strip()
@@ -1496,14 +537,10 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             crumbs.append((part, current))
 
         if p.path == "/change-bucket":
-            config.pop("bucket", None)
-            save_config(config)
-            return self.respond("<script>location='/'</script>")
+            return self.respond(self.render_bucket_form("Enter a new bucket name to switch."))
 
         if p.path == "/change-creds":
-            config.pop("aws", None)
-            save_config(config)
-            return self.respond("<script>location='/'</script>")
+            return self.respond(self.render_creds_form("Enter new AWS credentials."))
 
         if p.path == "/download":
             try:
@@ -1532,35 +569,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 return self.respond("<html><body>Failed to create link</body></html>")
             safe_key = html.escape(key)
             safe_url = html.escape(url)
-            return self.respond(f"""
-            <html><head>{self.fonts()}{self.css()}{self.scripts()}</head>
-            <body data-theme="dark">
-              <div class='bg-orb orb-1'></div>
-              <div class='bg-orb orb-2'></div>
-              <div class='bg-orb orb-3'></div>
-              <div class='page'>
-                <div class='preview-wrap'>
-                  <div class='preview-card'>
-                    <div class='preview-header'>
-                      <div>
-                        <div style='font-weight:600'>Share link</div>
-                        <div class='muted' style='font-size:12px'>{safe_key}</div>
-                      </div>
-                      <div style='display:flex;gap:8px;align-items:center;'>
-                        <a class='action-link' href='{back_url}'>Back</a>
-                        <a class='action-link' href='{safe_url}' target='_blank'>Open</a>
-                      </div>
-                    </div>
-                    <div class='preview-frame share-box mono'>{safe_url}</div>
-                    <div style='margin-top:12px'>
-                      <a class='action-link' href='#' data-copy='{safe_url}'>Copy URL</a>
-                    </div>
-                  </div>
-                </div>
-                <div id='toast' class='toast'></div>
-              </div>
-            </body></html>
-            """)
+            return self.respond(templates.render_presign(safe_key, safe_url, back_url))
 
         if p.path == "/preview":
             key = q.get("file", [""])[0]
@@ -1574,13 +583,13 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 return self.respond("<html><body>Preview failed</body></html>")
             embed = ""
             if mime.startswith("image/"):
-                embed = f"<img src='{html.escape(url)}' style='max-width:100%;border-radius:12px;'>"
+                embed = f"<img class='preview-media' src='{html.escape(url)}'>"
             elif mime.startswith("video/"):
-                embed = f"<video controls style='width:100%;border-radius:12px;' src='{html.escape(url)}'></video>"
+                embed = f"<video class='preview-video' controls src='{html.escape(url)}'></video>"
             elif mime.startswith("audio/"):
-                embed = f"<audio controls style='width:100%' src='{html.escape(url)}'></audio>"
+                embed = f"<audio class='preview-audio' controls src='{html.escape(url)}'></audio>"
             elif ext == ".pdf":
-                embed = f"<iframe src='{html.escape(url)}' style='width:100%;height:70vh;border:0;border-radius:12px;'></iframe>"
+                embed = f"<iframe class='preview-iframe' src='{html.escape(url)}'></iframe>"
             elif mime.startswith("text/") or ext in [".log", ".md", ".json", ".txt", ".csv"]:
                 try:
                     obj = s3.get_object(Bucket=config["bucket"], Key=key)
@@ -1590,32 +599,8 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                     embed = "<div class='preview-frame'>Unable to load text preview.</div>"
             else:
                 embed = f"<div class='preview-frame'>Preview not supported. <a class='action-link' href='{html.escape(url)}' target='_blank'>Open file</a></div>"
-            return self.respond(f"""
-            <html><head>{self.fonts()}{self.css()}{self.scripts()}</head>
-            <body data-theme="dark">
-              <div class='bg-orb orb-1'></div>
-              <div class='bg-orb orb-2'></div>
-              <div class='bg-orb orb-3'></div>
-              <div class='page'>
-                <div class='preview-wrap'>
-                  <div class='preview-card'>
-                    <div class='preview-header'>
-                      <div>
-                        <div style='font-weight:600'>Preview</div>
-                        <div class='muted' style='font-size:12px'>{safe_key}</div>
-                      </div>
-                      <div style='display:flex;gap:8px;align-items:center;'>
-                        <a class='action-link' href='{back_url}'>Back</a>
-                        <a class='action-link' href='/download?file={urllib.parse.quote(key)}'>Download</a>
-                      </div>
-                    </div>
-                    {embed}
-                  </div>
-                </div>
-                <div id='toast' class='toast'></div>
-              </div>
-            </body></html>
-            """)
+            download_url = f"/download?file={urllib.parse.quote(key)}"
+            return self.respond(templates.render_preview(safe_key, embed, back_url, download_url))
 
         if p.path == "/delete":
             try:
@@ -1768,6 +753,8 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         prefix_label = "/" if not prefix else "/" + prefix.strip("/")
         safe_prefix_label = html.escape(prefix_label)
         safe_prefix = html.escape(prefix)
+        user = self.current_user() or {}
+        safe_email = html.escape(user.get("email", ""))
         safe_bucket = html.escape(config["bucket"])
         crumbs_html = ""
         for i, (name, path) in enumerate(crumbs):
@@ -1811,27 +798,25 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         safe_prefix_uri = html.escape(f"s3://{config['bucket']}/{prefix}")
 
         page_html = f"""
-        <html><head>{self.fonts()}{self.css()}{self.scripts()}</head>
-        <body data-theme="dark">
-          <div class='bg-orb orb-1'></div>
-          <div class='bg-orb orb-2'></div>
-          <div class='bg-orb orb-3'></div>
-          <div class='page'>
           <div class='top'>
               <div class='brand'>
                 <div class='brand-mark'>S3</div>
                 <div>
                   S3 File Manager
-                <span class='chip'>{safe_bucket}</span>
+                <span class='chip'>{safe_email}</span>
                 </div>
               </div>
             <div class='right-actions'>
               <span class='badge-prefix'>{safe_prefix_label}</span>
               <span class='chip'><span class='status-dot'></span>Connected</span>
               <span class='chip'>Last refresh <span id='lastRefresh'>--</span></span>
-              <a href='/change-bucket'>Change Bucket</a>
-              <a class='danger' href='/change-creds'>Change Credentials</a>
-              <button id='themeToggle'>Light/Dark</button>
+              <span class='pill-ghost'>Bucket: {safe_bucket}</span>
+              <div class='link-group'>
+                <a href='/change-bucket'>Bucket</a>
+                <a href='/change-creds'>Credentials</a>
+                <a href='/change-password'>Password</a>
+              </div>
+              <a class='danger' href='/logout'>Logout</a>
             </div>
           </div>
 
@@ -1855,12 +840,12 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                     <input type='hidden' name='max' value='{max_keys}'>
                     <input id='searchBox' name='q' class='input' placeholder='Search files or folders...' value='{safe_query}'>
                   </form>
-                  <select id='typeFilter' class='input' style='max-width:150px'>
+                  <select id='typeFilter' class='input w-150'>
                     <option value='all'>All</option>
                     <option value='file'>Files</option>
                     <option value='folder'>Folders</option>
                   </select>
-                  <select id='sortSelect' class='input' style='max-width:180px'>
+                  <select id='sortSelect' class='input w-180'>
                     <option value='name'>Sort: Name</option>
                     <option value='size'>Sort: Size</option>
                     <option value='modified'>Sort: Modified</option>
@@ -1923,9 +908,9 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                   <input type='hidden' name='prefix' value='{safe_prefix}'>
                   <div id='dropzone' class='dropzone'>
                     <div>
-                      <div style='font-weight:600'>Drag & drop files</div>
-                      <div class='muted' style='font-size:12px'>or pick files to upload</div>
-                      <div id='fileCount' class='muted' style='font-size:12px'>No files selected</div>
+                      <div class='dropzone-title'>Drag & drop files</div>
+                      <div class='muted small'>or pick files to upload</div>
+                      <div id='fileCount' class='muted small'>No files selected</div>
                     </div>
                     <div>
                       <input id='fileInput' type='file' name='file' multiple>
@@ -1937,7 +922,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                       <button class='btn'>Upload</button>
                     </div>
                   </div>
-                  <div id='progressWrap' class='progress-wrap' style='display:none'>
+                  <div id='progressWrap' class='progress-wrap is-hidden'>
                     <div class='progress-bar'>
                       <div id='progressFill' class='progress-fill'></div>
                     </div>
@@ -1947,7 +932,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
 
                 <form class='folder-form' method='post' action='/create-folder'>
                   <input type='hidden' name='prefix' value='{safe_prefix}'>
-                  <input class='input' style='max-width:220px' name='folder' placeholder='New folder name'>
+                  <input class='input w-220' name='folder' placeholder='New folder name'>
                   <button class='btn secondary' type='submit'>Create Folder</button>
                 </form>
               </div>
@@ -1965,14 +950,135 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
               </div>
             </div>
           </div>
-          </div>
-        </body></html>
         """
-        self.respond(page_html)
+        self.respond(templates.render_main_page(page_html))
 
     # POST 
     def do_POST(self):
         global config, s3
+        if self.path in ["/login", "/register"]:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode()
+            form = urllib.parse.parse_qs(body)
+            email = form.get("email", [""])[0].strip().lower()
+            password = form.get("password", [""])[0]
+            if self.path == "/register":
+                confirm = form.get("password_confirm", [""])[0]
+                access_key = form.get("access_key", [""])[0].strip()
+                secret_key = form.get("secret_key", [""])[0].strip()
+                region = form.get("region", ["us-east-1"])[0].strip()
+                if not email or not password or not access_key or not secret_key or not region:
+                    error_html = "<div class='subtitle error'>All fields are required.</div>"
+                elif password != confirm:
+                    error_html = "<div class='subtitle error'>Passwords do not match.</div>"
+                else:
+                    try:
+                        with get_db_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "INSERT INTO users (email, password_hash, created_at) VALUES (%s, %s, %s) RETURNING id",
+                                    (email, hash_password(password), datetime.datetime.now(datetime.timezone.utc)),
+                                )
+                                user_id = cur.fetchone()[0]
+                            conn.commit()
+                        config["aws"] = {
+                            "access_key": encrypt(access_key),
+                            "secret_key": encrypt(secret_key),
+                            "region": region,
+                        }
+                        upsert_app_settings(aws=config["aws"])
+                        s3 = build_s3(config)
+                        token, _ = create_session(user_id)
+                        self.send_response(302)
+                        cookie = f"s3fm_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}"
+                        self.send_header("Set-Cookie", cookie)
+                        self.send_header("Location", "/")
+                        self.end_headers()
+                        return
+                    except psycopg2.IntegrityError:
+                        error_html = "<div class='subtitle error'>Email already exists.</div>"
+                fields = [
+                    "<input class='input' name='email' placeholder='Email' type='email' required>",
+                    "<input class='input' name='password' placeholder='Password' type='password' required>",
+                    "<input class='input' name='password_confirm' placeholder='Confirm password' type='password' required>",
+                    "<input class='input' name='access_key' placeholder='AWS Access Key' required>",
+                    "<input class='input' name='secret_key' placeholder='AWS Secret Key' required>",
+                    "<input class='input' name='region' value='us-east-1' required>",
+                ]
+                switch_html = "Already have an account? <a class='link' href='/login'>Sign in</a>"
+                return self.respond(templates.render_auth_form(
+                    "Create account", "Create your account and save AWS credentials once.", "/register", fields, error_html, switch_html
+                ))
+
+            if not email or not password:
+                error_html = "<div class='subtitle error'>Email and password are required.</div>"
+            else:
+                with get_db_conn() as conn:
+                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                        cur.execute("SELECT id, password_hash FROM users WHERE email = %s", (email,))
+                        user = cur.fetchone()
+                if user and verify_password(password, user["password_hash"]):
+                    token, _ = create_session(user["id"])
+                    self.send_response(302)
+                    cookie = f"s3fm_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}"
+                    self.send_header("Set-Cookie", cookie)
+                    self.send_header("Location", "/")
+                    self.end_headers()
+                    return
+                error_html = "<div class='subtitle error'>Invalid credentials.</div>"
+            fields = [
+                "<input class='input' name='email' placeholder='Email' type='email' required>",
+                "<input class='input' name='password' placeholder='Password' type='password' required>",
+            ]
+            switch_html = "No account? <a class='link' href='/register'>Create one</a>"
+            return self.respond(templates.render_auth_form(
+                "Sign in", "Welcome back. Access your S3 workspace.", "/login", fields, error_html, switch_html
+            ))
+
+        if self.path == "/change-password":
+            if not self.require_auth():
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode()
+            form = urllib.parse.parse_qs(body)
+            current_password = form.get("current_password", [""])[0]
+            new_password = form.get("new_password", [""])[0]
+            confirm_password = form.get("confirm_password", [""])[0]
+            user = self.current_user()
+            error_html = ""
+            if not current_password or not new_password or not confirm_password:
+                error_html = "<div class='subtitle error'>All fields are required.</div>"
+            elif new_password != confirm_password:
+                error_html = "<div class='subtitle error'>New passwords do not match.</div>"
+            else:
+                with get_db_conn() as conn:
+                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                        cur.execute("SELECT id, password_hash FROM users WHERE id = %s", (user["id"],))
+                        row = cur.fetchone()
+                        if not row or not verify_password(current_password, row["password_hash"]):
+                            error_html = "<div class='subtitle error'>Current password is incorrect.</div>"
+                        else:
+                            cur.execute(
+                                "UPDATE users SET password_hash = %s WHERE id = %s",
+                                (hash_password(new_password), user["id"]),
+                            )
+                            conn.commit()
+                            self.send_response(302)
+                            self.send_header("Location", "/")
+                            self.end_headers()
+                            return
+            fields = [
+                "<input class='input' name='current_password' placeholder='Current password' type='password' required>",
+                "<input class='input' name='new_password' placeholder='New password' type='password' required>",
+                "<input class='input' name='confirm_password' placeholder='Confirm new password' type='password' required>",
+            ]
+            switch_html = "Back to files? <a class='link' href='/'>Go to manager</a>"
+            return self.respond(templates.render_auth_form(
+                "Change password", "Update your account password.", "/change-password", fields, error_html, switch_html
+            ))
+
+        if not self.require_auth():
+            return
         if self.path == "/save-bucket":
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length).decode()
@@ -1981,6 +1087,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             if not bucket:
                 return self.respond(self.render_bucket_form("Bucket name is required."))
             config["bucket"] = bucket
+            upsert_app_settings(bucket=bucket)
             if not save_config(config):
                 return self.respond(self.render_bucket_form("Unable to save configuration. Check permissions."))
             return self.respond("<script>location='/'</script>")
@@ -1999,9 +1106,9 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 "secret_key": encrypt(secret_key),
                 "region": region,
             }
+            upsert_app_settings(aws=config["aws"])
             if not save_config(config):
                 return self.respond(self.render_creds_form("Unable to save configuration. Check permissions."))
-            global s3
             s3 = build_s3(config)
             if not s3:
                 config.pop("aws", None)
@@ -2145,6 +1252,8 @@ class ReusableTCPServer(socketserver.TCPServer):
     allow_reuse_address = True
 
 setup_logging()
+init_auth_db()
+apply_db_settings()
 try:
     with ReusableTCPServer(("", PORT), UploadHandler) as httpd:
         logging.info("Serving S3 manager on port %s (HTTP)", PORT)

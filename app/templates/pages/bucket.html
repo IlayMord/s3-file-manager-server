@@ -1,0 +1,11 @@
+<div class='wrap'>
+  <div class='card card-narrow'>
+    <h2>Connect a Bucket</h2>
+    <div class='subtitle'>Enter the S3 bucket name to manage files.</div>
+    {{error_html}}
+    <form class='auth-form' method='post' action='/save-bucket'>
+      <input class='input' name='bucket' placeholder='bucket-name'>
+      <button class='btn'>Continue</button>
+    </form>
+  </div>
+</div>

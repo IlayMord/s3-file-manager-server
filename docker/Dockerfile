@@ -8,6 +8,9 @@ COPY app/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/server.py .
+COPY app/templates.py .
+COPY app/templates/ ./templates/
+COPY app/static/ ./static/
 
 RUN useradd -m appuser
 USER appuser

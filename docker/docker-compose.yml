@@ -16,6 +16,11 @@ services:
 
     volumes:
       - ../app/data:/app/data
+    environment:
+      - S3FM_DB_URL=postgresql://s3fm:s3fm@postgres:5432/s3_file_manager
+
+    depends_on:
+      - postgres
 
     restart: unless-stopped
 
@@ -25,3 +30,17 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  postgres:
+    image: postgres:16
+    container_name: s3fm-postgres
+    environment:
+      - POSTGRES_USER=s3fm
+      - POSTGRES_PASSWORD=s3fm
+      - POSTGRES_DB=s3_file_manager
+    volumes:
+      - s3fm_pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  s3fm_pg_data:

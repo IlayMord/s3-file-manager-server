@@ -1,0 +1,44 @@
+<main class='auth-layout'>
+  <section class='auth-hero'>
+    <div class='auth-tag'>⚡ S3 File Manager <span class='auth-tag-accent'>secure access</span></div>
+    <h1 class='auth-title'>Manage your <em class='auth-accent'>S3 files</em> with confidence.</h1>
+    <p class='auth-lead'>Upload, browse, share and organize objects across prefixes with a fast, focused interface built for daily ops.</p>
+    <div class='auth-footer'>Your workspace loads instantly after sign‑in.</div>
+  </section>
+  <aside class='auth-panel'>
+    <h2 class='auth-panel-title'>Workspace Overview</h2>
+    <div class='auth-stats'>
+      <div class='auth-stat'>
+        <strong>Bucket access</strong>
+        <span>Connect once, manage securely</span>
+      </div>
+      <div class='auth-stat'>
+        <strong>Secure sessions</strong>
+        <span>Signed cookies + encrypted keys</span>
+      </div>
+      <div class='auth-stat'>
+        <strong>Bulk actions</strong>
+        <span>Move, copy, delete at scale</span>
+      </div>
+      <div class='auth-stat'>
+        <strong>Share links</strong>
+        <span>Presigned URLs on demand</span>
+      </div>
+    </div>
+    <div class='auth-feature-list'>
+      <div class='auth-feature'><span class='auth-dot'></span> Prefix navigation with breadcrumbs</div>
+      <div class='auth-feature'><span class='auth-dot'></span> Drag & drop uploads with progress</div>
+      <div class='auth-feature'><span class='auth-dot'></span> Secure credentials stored locally</div>
+    </div>
+    <div class='auth-form-card'>
+      <h2>{{auth_title}}</h2>
+      <div class='subtitle'>{{auth_subtitle}}</div>
+      {{error_html}}
+      <form class='auth-form' method='post' action='{{auth_action}}'>
+        {{fields_html}}
+        <button class='btn' type='submit'>Continue</button>
+      </form>
+      <div class='auth-switch'>{{switch_html}}</div>
+    </div>
+  </aside>
+</main>

@@ -1,0 +1,13 @@
+<div class='wrap'>
+  <div class='card card-narrow'>
+    <h2>AWS Credentials</h2>
+    <div class='subtitle'>Access key is stored locally on this server only.</div>
+    {{error_html}}
+    <form class='auth-form' method='post' action='/save-creds'>
+      <input class='input' name='access_key' placeholder='Access Key'>
+      <input class='input' name='secret_key' placeholder='Secret Key'>
+      <input class='input' name='region' value='us-east-1'>
+      <button class='btn'>Save</button>
+    </form>
+  </div>
+</div>
