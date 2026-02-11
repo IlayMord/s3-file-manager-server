@@ -37,3 +37,13 @@ variable "max_size" {
 variable "key_name" {
   type = string
 }
+
+variable "cpu_target_value" {
+  type    = number
+  default = 50
+}
+
+variable "estimated_instance_warmup" {
+  type    = number
+  default = 180
+}

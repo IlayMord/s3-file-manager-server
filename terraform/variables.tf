@@ -42,3 +42,13 @@ variable "asg_max_size" {
   type    = number
   default = 4
 }
+
+variable "asg_cpu_target_value" {
+  type    = number
+  default = 50
+}
+
+variable "asg_estimated_instance_warmup" {
+  type    = number
+  default = 180
+}

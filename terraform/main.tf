@@ -13,15 +13,17 @@ module "nlb" {
 }
 
 module "asg" {
-  source            = "./modules/asg"
-  name              = "s3fm"
-  subnet_id         = module.vpc.subnet_id
-  security_group_id = module.vpc.security_group_id
-  target_group_arn = module.nlb.target_group_arn
-  ami_id            = var.ami_id
-  instance_type     = var.instance_type
-  key_name          = var.key_name
-  desired_capacity  = var.asg_desired_capacity
-  min_size          = var.asg_min_size
-  max_size          = var.asg_max_size
+  source                    = "./modules/asg"
+  name                      = "s3fm"
+  subnet_id                 = module.vpc.subnet_id
+  security_group_id         = module.vpc.security_group_id
+  target_group_arn          = module.nlb.target_group_arn
+  ami_id                    = var.ami_id
+  instance_type             = var.instance_type
+  key_name                  = var.key_name
+  desired_capacity          = var.asg_desired_capacity
+  min_size                  = var.asg_min_size
+  max_size                  = var.asg_max_size
+  cpu_target_value          = var.asg_cpu_target_value
+  estimated_instance_warmup = var.asg_estimated_instance_warmup
 }
