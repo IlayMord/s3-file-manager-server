@@ -7,7 +7,7 @@ resource "aws_launch_template" "this" {
 
   vpc_security_group_ids = [var.security_group_id]
 
-  user_data = base64encode(<<-EOF
+user_data = base64encode(<<-EOF
 #!/bin/bash
 set -e
 
@@ -24,9 +24,17 @@ if [ ! -d "s3-file-manager-server" ]; then
 fi
 
 cd s3-file-manager-server/docker
+
+cat <<EOT > .env
+POSTGRES_USER=s3fm
+POSTGRES_PASSWORD=s3fm
+POSTGRES_DB=s3_file_manager
+EOT
+
 docker-compose up -d
+
 EOF
-  )
+)
 
   tag_specifications {
     resource_type = "instance"

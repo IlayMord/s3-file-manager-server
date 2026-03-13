@@ -93,7 +93,7 @@ def init_auth_db():
                     cur.execute(
                         """
                         CREATE TABLE IF NOT EXISTS app_settings (
-                          id INTEGER PRIMARY KEY,
+                          user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                           bucket TEXT,
                           aws_access_key TEXT,
                           aws_secret_key TEXT,
@@ -101,25 +101,64 @@ def init_auth_db():
                         )
                         """
                     )
+                    cur.execute(
+                        """
+                        DO $$
+                        BEGIN
+                          IF EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_name = 'app_settings' AND column_name = 'id'
+                          ) AND NOT EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_name = 'app_settings' AND column_name = 'user_id'
+                          ) THEN
+                            ALTER TABLE app_settings RENAME COLUMN id TO user_id;
+                          END IF;
+                        END $$;
+                        """
+                    )
+                    cur.execute(
+                        """
+                        DO $$
+                        BEGIN
+                          IF NOT EXISTS (
+                            SELECT 1
+                            FROM information_schema.table_constraints
+                            WHERE table_name = 'app_settings'
+                              AND constraint_name = 'app_settings_user_id_fkey'
+                          ) THEN
+                            ALTER TABLE app_settings
+                            ADD CONSTRAINT app_settings_user_id_fkey
+                            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+                          END IF;
+                        EXCEPTION
+                          WHEN duplicate_object THEN NULL;
+                        END $$;
+                        """
+                    )
             return
         except Exception:
             time.sleep(2)
     raise RuntimeError("Failed to connect to Postgres for auth DB initialization.")
 
-def get_app_settings():
+def get_app_settings(user_id):
     with get_db_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
                 SELECT bucket, aws_access_key, aws_secret_key, aws_region
                 FROM app_settings
-                WHERE id = 1
+                WHERE user_id = %s
                 """
+                ,
+                (user_id,)
             )
             return cur.fetchone()
 
-def upsert_app_settings(bucket=None, aws=None):
-    existing = get_app_settings() or {}
+def upsert_app_settings(user_id, bucket=None, aws=None):
+    existing = get_app_settings(user_id) or {}
     if bucket is None:
         bucket = existing.get("bucket")
     if aws is None:
@@ -134,32 +173,17 @@ def upsert_app_settings(bucket=None, aws=None):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO app_settings (id, bucket, aws_access_key, aws_secret_key, aws_region)
-                VALUES (1, %s, %s, %s, %s)
-                ON CONFLICT (id) DO UPDATE SET
+                INSERT INTO app_settings (user_id, bucket, aws_access_key, aws_secret_key, aws_region)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
                   bucket = EXCLUDED.bucket,
                   aws_access_key = EXCLUDED.aws_access_key,
                   aws_secret_key = EXCLUDED.aws_secret_key,
                   aws_region = EXCLUDED.aws_region
                 """,
-                (bucket, aws_access_key, aws_secret_key, aws_region),
+                (user_id, bucket, aws_access_key, aws_secret_key, aws_region),
             )
         conn.commit()
-
-def apply_db_settings():
-    global config, s3
-    settings = get_app_settings()
-    if not settings:
-        return
-    if settings.get("bucket"):
-        config["bucket"] = settings["bucket"]
-    if settings.get("aws_access_key") and settings.get("aws_secret_key") and settings.get("aws_region"):
-        config["aws"] = {
-            "access_key": settings["aws_access_key"],
-            "secret_key": settings["aws_secret_key"],
-            "region": settings["aws_region"],
-        }
-    s3 = build_s3(config) if config.get("aws") else None
 
 def hash_password(password):
     salt = secrets.token_bytes(16)
@@ -353,6 +377,15 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode('utf-8'))
 
+    def redirect_to_prefix(self, prefix="", query=""):
+        location = f"/?prefix={urllib.parse.quote(prefix)}" if prefix else "/"
+        if query:
+            sep = "&" if "?" in location else "?"
+            location += f"{sep}q={urllib.parse.quote(query)}"
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.end_headers()
+
     def respond_text(self, status, text, content_type="text/plain; charset=utf-8"):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -363,6 +396,26 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         cookies = parse_cookies(self.headers.get("Cookie", ""))
         token = cookies.get("s3fm_session")
         return get_user_by_session(token)
+
+    def get_runtime_config(self, user=None):
+        runtime_config = dict(config)
+        if not user:
+            return runtime_config
+        settings = get_app_settings(user["id"]) or {}
+        runtime_config.pop("bucket", None)
+        runtime_config.pop("aws", None)
+        if settings.get("bucket"):
+            runtime_config["bucket"] = settings["bucket"]
+        if settings.get("aws_access_key") and settings.get("aws_secret_key") and settings.get("aws_region"):
+            runtime_config["aws"] = {
+                "access_key": settings["aws_access_key"],
+                "secret_key": settings["aws_secret_key"],
+                "region": settings["aws_region"],
+            }
+        return runtime_config
+
+    def get_runtime_s3(self, runtime_config):
+        return build_s3(runtime_config) if runtime_config.get("aws") else None
 
     def require_auth(self):
         public = {"/login", "/register"}
@@ -395,19 +448,19 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(handle.read())
 
 
-    def presign_url(self, key, expires=900):
+    def presign_url(self, s3_client, bucket, key, expires=900):
         try:
-            return s3.generate_presigned_url(
+            return s3_client.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": config["bucket"], "Key": key},
+                Params={"Bucket": bucket, "Key": key},
                 ExpiresIn=expires
             )
         except Exception:
             return ""
 
-    def stream_object(self, key, download=True, override_type=""):
+    def stream_object(self, s3_client, bucket, key, download=True, override_type=""):
         try:
-            obj = s3.get_object(Bucket=config["bucket"], Key=key)
+            obj = s3_client.get_object(Bucket=bucket, Key=key)
             content_type = override_type or obj.get("ContentType") or mimetypes.guess_type(key)[0] or "application/octet-stream"
             filename = os.path.basename(key)
             self.send_response(200)
@@ -427,33 +480,32 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             return False
 
-    def copy_prefix(self, old_prefix, new_prefix, delete_source=False):
+    def copy_prefix(self, s3_client, bucket, old_prefix, new_prefix, delete_source=False):
         token = ""
         while True:
             args = {
-                "Bucket": config["bucket"],
+                "Bucket": bucket,
                 "Prefix": old_prefix
             }
             if token:
                 args["ContinuationToken"] = token
-            resp = s3.list_objects_v2(**args)
+            resp = s3_client.list_objects_v2(**args)
             for obj in resp.get("Contents", []):
                 src_key = obj["Key"]
                 dst_key = new_prefix + src_key[len(old_prefix):]
-                s3.copy_object(
-                    Bucket=config["bucket"],
-                    CopySource={"Bucket": config["bucket"], "Key": src_key},
+                s3_client.copy_object(
+                    Bucket=bucket,
+                    CopySource={"Bucket": bucket, "Key": src_key},
                     Key=dst_key
                 )
                 if delete_source:
-                    s3.delete_object(Bucket=config["bucket"], Key=src_key)
+                    s3_client.delete_object(Bucket=bucket, Key=src_key)
             if not resp.get("IsTruncated"):
                 break
             token = resp.get("NextContinuationToken", "")
 
     # GET
     def do_GET(self):
-        global config, s3
         p = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(p.query)
 
@@ -489,16 +541,6 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 "Create account", "Create your account and save AWS credentials once.", "/register", fields, error_html, switch_html
             ))
 
-        if p.path == "/logout":
-            cookies = parse_cookies(self.headers.get("Cookie", ""))
-            token = cookies.get("s3fm_session")
-            delete_session(token)
-            self.send_response(302)
-            self.send_header("Set-Cookie", "s3fm_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
-            self.send_header("Location", "/login")
-            self.end_headers()
-            return
-
         if p.path == "/change-password":
             if not self.require_auth():
                 return
@@ -513,13 +555,19 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 "Change password", "Update your account password.", "/change-password", fields, error_html, switch_html
             ))
 
+        user = self.current_user()
+        runtime_config = self.get_runtime_config(user)
+        runtime_s3 = self.get_runtime_s3(runtime_config)
+
         # No bucket has been configured yet
-        if not config.get("bucket"):
+        if not runtime_config.get("bucket"):
             return self.respond(self.render_bucket_form())
 
         # AWS credentials are not configured yet
-        if not config.get("aws") or not s3:
+        if not runtime_config.get("aws") or not runtime_s3:
             return self.respond(self.render_creds_form())
+
+        bucket = runtime_config["bucket"]
 
         prefix = q.get("prefix", [""])[0]
         token = q.get("token", [""])[0]
@@ -529,6 +577,8 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             max_keys = max(50, min(1000, int(max_keys_raw)))
         except Exception:
             max_keys = 500
+        safe_prefix = html.escape(prefix)
+        safe_query = html.escape(query)
         parts = [p for p in prefix.strip("/").split("/") if p] if prefix else []
         crumbs = [("Root", "")]
         current = ""
@@ -545,7 +595,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         if p.path == "/download":
             try:
                 key = q.get("file", [""])[0]
-                if self.stream_object(key, download=True):
+                if self.stream_object(runtime_s3, bucket, key, download=True):
                     return
                 return self.respond("<html><body>Download failed</body></html>")
             except Exception:
@@ -555,7 +605,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             try:
                 key = q.get("file", [""])[0]
                 local = f"/tmp/{os.path.basename(key)}"
-                s3.download_file(config["bucket"], key, local)
+                runtime_s3.download_file(bucket, key, local)
                 return self.respond(f"<html><body>Downloaded to {local}</body></html>")
             except Exception:
                 return self.respond("<html><body>Download failed</body></html>")
@@ -564,7 +614,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             key = q.get("file", [""])[0]
             back_prefix = q.get("prefix", [""])[0]
             back_url = f"/?prefix={urllib.parse.quote(back_prefix)}" if back_prefix else "/"
-            url = self.presign_url(key, expires=900)
+            url = self.presign_url(runtime_s3, bucket, key, expires=900)
             if not url:
                 return self.respond("<html><body>Failed to create link</body></html>")
             safe_key = html.escape(key)
@@ -577,7 +627,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             back_url = f"/?prefix={urllib.parse.quote(back_prefix)}" if back_prefix else "/"
             ext = os.path.splitext(key)[1].lower()
             mime = mimetypes.guess_type(key)[0] or ""
-            url = self.presign_url(key, expires=900)
+            url = self.presign_url(runtime_s3, bucket, key, expires=900)
             safe_key = html.escape(key)
             if not url:
                 return self.respond("<html><body>Preview failed</body></html>")
@@ -592,7 +642,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 embed = f"<iframe class='preview-iframe' src='{html.escape(url)}'></iframe>"
             elif mime.startswith("text/") or ext in [".log", ".md", ".json", ".txt", ".csv"]:
                 try:
-                    obj = s3.get_object(Bucket=config["bucket"], Key=key)
+                    obj = runtime_s3.get_object(Bucket=bucket, Key=key)
                     body = obj["Body"].read(200000).decode("utf-8", errors="replace")
                     embed = f"<pre class='preview-frame mono'>{html.escape(body)}</pre>"
                 except Exception:
@@ -602,30 +652,17 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             download_url = f"/download?file={urllib.parse.quote(key)}"
             return self.respond(templates.render_preview(safe_key, embed, back_url, download_url))
 
-        if p.path == "/delete":
-            try:
-                key = q.get("file", [""])[0]
-                s3.delete_object(Bucket=config["bucket"], Key=key)
-                logging.info("Delete object key=%s bucket=%s", key, config.get("bucket"))
-                back = f"/?prefix={urllib.parse.quote(prefix)}"
-                if query:
-                    back += f"&q={urllib.parse.quote(query)}"
-                return self.respond(f"<script>location='{back}'</script>")
-            except Exception:
-                logging.exception("Delete failed")
-                return self.respond("<html><body>Delete failed</body></html>")
-
         # List objects with folder-style prefixes
         try:
             list_args = {
-                "Bucket": config["bucket"],
+                "Bucket": bucket,
                 "Prefix": prefix if prefix else "",
                 "Delimiter": "/",
                 "MaxKeys": max_keys
             }
             if token:
                 list_args["ContinuationToken"] = token
-            resp = s3.list_objects_v2(**list_args)
+            resp = runtime_s3.list_objects_v2(**list_args)
         except Exception:
             resp = {}
 
@@ -651,7 +688,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             name = pref[len(prefix):].strip("/")
             safe_name = html.escape(name)
             safe_key = html.escape(pref)
-            safe_uri = html.escape(f"s3://{config['bucket']}/{pref}")
+            safe_uri = html.escape(f"s3://{bucket}/{pref}")
             folder_rows += f"""
             <tr data-kind="folder" data-name="{safe_name}" data-size="0" data-date="" data-key="{safe_key}">
               <td class='col-select'><input class='checkbox row-select' type='checkbox' data-key="{safe_key}"></td>
@@ -667,7 +704,12 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
               <td class='actions'>
                 <a class='link' href='/?prefix={urllib.parse.quote(pref)}'>Open</a>
                 <a class='link' href='#' data-rename='{safe_key}' data-name='{safe_name}'>Rename</a>
-                <a class='link danger' href='/delete?file={urllib.parse.quote(pref)}&prefix={urllib.parse.quote(prefix)}' data-delete-url='/delete?file={urllib.parse.quote(pref)}&prefix={urllib.parse.quote(prefix)}'>Delete</a>
+                <form method='post' action='/delete' class='inline-form'>
+                  <input type='hidden' name='file' value='{safe_key}'>
+                  <input type='hidden' name='prefix' value='{safe_prefix}'>
+                  <input type='hidden' name='q' value='{safe_query}'>
+                  <button class='link danger' type='submit'>Delete</button>
+                </form>
                 <a class='action-link' href='#' data-copy='{safe_uri}'>Copy URI</a>
               </td>
             </tr>
@@ -686,7 +728,12 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 <a class='action-link' href='/?prefix={urllib.parse.quote(pref)}'>Open</a>
                 <a class='action-link' href='#' data-rename='{safe_key}' data-name='{safe_name}'>Rename</a>
                 <a class='action-link' href='#' data-copy='{safe_uri}'>Copy URI</a>
-                <a class='action-link link danger' href='/delete?file={urllib.parse.quote(pref)}&prefix={urllib.parse.quote(prefix)}' data-delete-url='/delete?file={urllib.parse.quote(pref)}&prefix={urllib.parse.quote(prefix)}'>Delete</a>
+                <form method='post' action='/delete' class='inline-form'>
+                  <input type='hidden' name='file' value='{safe_key}'>
+                  <input type='hidden' name='prefix' value='{safe_prefix}'>
+                  <input type='hidden' name='q' value='{safe_query}'>
+                  <button class='action-link link danger' type='submit'>Delete</button>
+                </form>
               </div>
               <label class='meta-pill'><input class='checkbox row-select' type='checkbox' data-key="{safe_key}"> Select</label>
             </div>
@@ -702,7 +749,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             safe_name = html.escape(name)
             safe_key = html.escape(o["Key"])
             safe_ext = html.escape(ext)
-            safe_uri = html.escape(f"s3://{config['bucket']}/{o['Key']}")
+            safe_uri = html.escape(f"s3://{bucket}/{o['Key']}")
             file_rows += f"""
             <tr data-kind="file" data-name="{safe_name}" data-size="{o.get('Size', 0)}" data-date="{modified_iso}" data-key="{safe_key}">
               <td class='col-select'><input class='checkbox row-select' type='checkbox' data-key="{safe_key}"></td>
@@ -715,7 +762,12 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 <a class='link' href='/preview?file={urllib.parse.quote(o["Key"])}&prefix={urllib.parse.quote(prefix)}' target='_blank'>Preview</a>
                 <a class='link' href='/presign?file={urllib.parse.quote(o["Key"])}&prefix={urllib.parse.quote(prefix)}' target='_blank'>Share</a>
                 <a class='link' href='#' data-rename='{safe_key}' data-name='{safe_name}'>Rename</a>
-                <a class='link danger' href='/delete?file={urllib.parse.quote(o["Key"])}&prefix={urllib.parse.quote(prefix)}' data-delete-url='/delete?file={urllib.parse.quote(o["Key"])}&prefix={urllib.parse.quote(prefix)}'>Delete</a>
+                <form method='post' action='/delete' class='inline-form'>
+                  <input type='hidden' name='file' value='{safe_key}'>
+                  <input type='hidden' name='prefix' value='{safe_prefix}'>
+                  <input type='hidden' name='q' value='{safe_query}'>
+                  <button class='link danger' type='submit'>Delete</button>
+                </form>
                 <a class='action-link' href='#' data-copy='{safe_uri}'>Copy URI</a>
               </td>
             </tr>
@@ -737,7 +789,12 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 <a class='action-link' href='/presign?file={urllib.parse.quote(o["Key"])}&prefix={urllib.parse.quote(prefix)}' target='_blank'>Share</a>
                 <a class='action-link' href='#' data-rename='{safe_key}' data-name='{safe_name}'>Rename</a>
                 <a class='action-link' href='#' data-copy='{safe_uri}'>Copy URI</a>
-                <a class='action-link link danger' href='/delete?file={urllib.parse.quote(o["Key"])}&prefix={urllib.parse.quote(prefix)}' data-delete-url='/delete?file={urllib.parse.quote(o["Key"])}&prefix={urllib.parse.quote(prefix)}'>Delete</a>
+                <form method='post' action='/delete' class='inline-form'>
+                  <input type='hidden' name='file' value='{safe_key}'>
+                  <input type='hidden' name='prefix' value='{safe_prefix}'>
+                  <input type='hidden' name='q' value='{safe_query}'>
+                  <button class='action-link link danger' type='submit'>Delete</button>
+                </form>
               </div>
               <label class='meta-pill'><input class='checkbox row-select' type='checkbox' data-key="{safe_key}"> Select</label>
             </div>
@@ -755,14 +812,14 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         safe_prefix = html.escape(prefix)
         user = self.current_user() or {}
         safe_email = html.escape(user.get("email", ""))
-        safe_bucket = html.escape(config["bucket"])
+        safe_bucket = html.escape(bucket)
         crumbs_html = ""
         for i, (name, path) in enumerate(crumbs):
             cls = "crumb current" if i == len(crumbs) - 1 else "crumb"
             target = f"/?prefix={urllib.parse.quote(path)}" if path else "/"
             crumbs_html += f"<a class='{cls}' href='{target}'>{html.escape(name)}</a>"
         latest_label = self.format_date(latest_modified) if latest_modified else "--"
-        region_label = (config.get("aws") or {}).get("region", "--")
+        region_label = (runtime_config.get("aws") or {}).get("region", "--")
         safe_region = html.escape(region_label)
         stats_html = f"""
         <div class='stat-grid'>
@@ -794,8 +851,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         if next_token:
             next_url = f"/?prefix={urllib.parse.quote(prefix)}&token={urllib.parse.quote(next_token)}{max_param}{query_param}"
             next_html = f"<div class='pager'><a class='action-link' href='{next_url}'>Next page</a></div>"
-        safe_query = html.escape(query)
-        safe_prefix_uri = html.escape(f"s3://{config['bucket']}/{prefix}")
+        safe_prefix_uri = html.escape(f"s3://{bucket}/{prefix}")
 
         page_html = f"""
           <div class='top'>
@@ -816,7 +872,9 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 <a href='/change-creds'>Credentials</a>
                 <a href='/change-password'>Password</a>
               </div>
-              <a class='danger' href='/logout'>Logout</a>
+              <form method='post' action='/logout' class='inline-form'>
+                <button class='danger' type='submit'>Logout</button>
+              </form>
             </div>
           </div>
 
@@ -955,7 +1013,6 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
 
     # POST 
     def do_POST(self):
-        global config, s3
         if self.path in ["/login", "/register"]:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length).decode()
@@ -986,8 +1043,11 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                             "secret_key": encrypt(secret_key),
                             "region": region,
                         }
-                        upsert_app_settings(aws=config["aws"])
-                        s3 = build_s3(config)
+                        upsert_app_settings(user_id, aws={
+                            "access_key": encrypt(access_key),
+                            "secret_key": encrypt(secret_key),
+                            "region": region,
+                        })
                         token, _ = create_session(user_id)
                         self.send_response(302)
                         cookie = f"s3fm_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}"
@@ -1079,6 +1139,37 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
 
         if not self.require_auth():
             return
+        user = self.current_user()
+        runtime_config = self.get_runtime_config(user)
+        runtime_s3 = self.get_runtime_s3(runtime_config)
+        bucket = runtime_config.get("bucket")
+        if self.path == "/logout":
+            cookies = parse_cookies(self.headers.get("Cookie", ""))
+            token = cookies.get("s3fm_session")
+            delete_session(token)
+            self.send_response(302)
+            self.send_header("Set-Cookie", "s3fm_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+        if self.path == "/delete":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode()
+            form = urllib.parse.parse_qs(body)
+            key = form.get("file", [""])[0]
+            prefix = form.get("prefix", [""])[0]
+            query = form.get("q", [""])[0].strip()
+            if not key:
+                return self.redirect_to_prefix(prefix, query)
+            try:
+                if not runtime_s3 or not bucket:
+                    return self.respond("<html><body>Delete failed</body></html>")
+                runtime_s3.delete_object(Bucket=bucket, Key=key)
+                logging.info("Delete object key=%s bucket=%s", key, bucket)
+            except Exception:
+                logging.exception("Delete failed")
+                return self.respond("<html><body>Delete failed</body></html>")
+            return self.redirect_to_prefix(prefix, query)
         if self.path == "/save-bucket":
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length).decode()
@@ -1086,10 +1177,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             bucket = form.get("bucket", [""])[0].strip()
             if not bucket:
                 return self.respond(self.render_bucket_form("Bucket name is required."))
-            config["bucket"] = bucket
-            upsert_app_settings(bucket=bucket)
-            if not save_config(config):
-                return self.respond(self.render_bucket_form("Unable to save configuration. Check permissions."))
+            upsert_app_settings(user["id"], bucket=bucket)
             return self.respond("<script>location='/'</script>")
 
         if self.path == "/save-creds":
@@ -1101,19 +1189,16 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             region = form.get("region", ["us-east-1"])[0].strip()
             if not access_key or not secret_key or not region:
                 return self.respond(self.render_creds_form("All fields are required."))
-            config["aws"] = {
+            aws_settings = {
                 "access_key": encrypt(access_key),
                 "secret_key": encrypt(secret_key),
                 "region": region,
             }
-            upsert_app_settings(aws=config["aws"])
-            if not save_config(config):
-                return self.respond(self.render_creds_form("Unable to save configuration. Check permissions."))
-            s3 = build_s3(config)
-            if not s3:
-                config.pop("aws", None)
-                save_config(config)
+            test_config = dict(runtime_config)
+            test_config["aws"] = aws_settings
+            if not build_s3(test_config):
                 return self.respond(self.render_creds_form("Credentials are invalid or incomplete."))
+            upsert_app_settings(user["id"], aws=aws_settings)
             return self.respond("<script>location='/'</script>")
 
         if self.path == "/create-folder":
@@ -1123,11 +1208,13 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             prefix = form.get("prefix", [""])[0]
             name = form.get("folder", [""])[0].strip()
             if name:
+                if not runtime_s3 or not bucket:
+                    return self.respond("<html><body>Create folder failed</body></html>")
                 if not name.endswith("/"):
                     name += "/"
                 key = (prefix or "") + name
-                s3.put_object(Bucket=config["bucket"], Key=key, Body=b"")
-                logging.info("Create folder key=%s bucket=%s", key, config.get("bucket"))
+                runtime_s3.put_object(Bucket=bucket, Key=key, Body=b"")
+                logging.info("Create folder key=%s bucket=%s", key, bucket)
             back = f"/?prefix={urllib.parse.quote(prefix)}" if prefix else "/"
             return self.respond(f"<script>location='{back}'</script>")
 
@@ -1143,39 +1230,43 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             if action in ["move", "copy"] and target and not target.endswith("/"):
                 target += "/"
             if action == "delete":
+                if not runtime_s3 or not bucket:
+                    return self.respond("<html><body>Bulk action failed</body></html>")
                 for key in keys:
                     if key.endswith("/"):
                         token = ""
                         while True:
-                            args = {"Bucket": config["bucket"], "Prefix": key}
+                            args = {"Bucket": bucket, "Prefix": key}
                             if token:
                                 args["ContinuationToken"] = token
-                            resp = s3.list_objects_v2(**args)
+                            resp = runtime_s3.list_objects_v2(**args)
                             for obj in resp.get("Contents", []):
-                                s3.delete_object(Bucket=config["bucket"], Key=obj["Key"])
+                                runtime_s3.delete_object(Bucket=bucket, Key=obj["Key"])
                             if not resp.get("IsTruncated"):
                                 break
                             token = resp.get("NextContinuationToken", "")
                     else:
-                        s3.delete_object(Bucket=config["bucket"], Key=key)
-                logging.info("Bulk delete count=%s bucket=%s", len(keys), config.get("bucket"))
+                        runtime_s3.delete_object(Bucket=bucket, Key=key)
+                logging.info("Bulk delete count=%s bucket=%s", len(keys), bucket)
                 return self.respond(f"<script>location='{back}'</script>")
             if action in ["move", "copy"] and target:
+                if not runtime_s3 or not bucket:
+                    return self.respond("<html><body>Bulk action failed</body></html>")
                 for key in keys:
                     if key.endswith("/"):
                         name = key.rstrip("/").split("/")[-1] + "/"
                         new_prefix = target + name
-                        self.copy_prefix(key, new_prefix, delete_source=(action == "move"))
+                        self.copy_prefix(runtime_s3, bucket, key, new_prefix, delete_source=(action == "move"))
                     else:
                         new_key = target + os.path.basename(key)
-                        s3.copy_object(
-                            Bucket=config["bucket"],
-                            CopySource={"Bucket": config["bucket"], "Key": key},
+                        runtime_s3.copy_object(
+                            Bucket=bucket,
+                            CopySource={"Bucket": bucket, "Key": key},
                             Key=new_key
                         )
                         if action == "move":
-                            s3.delete_object(Bucket=config["bucket"], Key=key)
-                logging.info("Bulk action=%s count=%s target=%s bucket=%s", action, len(keys), target, config.get("bucket"))
+                            runtime_s3.delete_object(Bucket=bucket, Key=key)
+                logging.info("Bulk action=%s count=%s target=%s bucket=%s", action, len(keys), target, bucket)
                 return self.respond(f"<script>location='{back}'</script>")
             return self.respond("<html><body>Bulk action failed</body></html>")
 
@@ -1201,15 +1292,19 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             if is_folder and not new_key.endswith("/"):
                 new_key += "/"
             if is_folder:
-                self.copy_prefix(old_key, new_key, delete_source=True)
+                if not runtime_s3 or not bucket:
+                    return self.respond("<html><body>Rename failed</body></html>")
+                self.copy_prefix(runtime_s3, bucket, old_key, new_key, delete_source=True)
             else:
-                s3.copy_object(
-                    Bucket=config["bucket"],
-                    CopySource={"Bucket": config["bucket"], "Key": old_key},
+                if not runtime_s3 or not bucket:
+                    return self.respond("<html><body>Rename failed</body></html>")
+                runtime_s3.copy_object(
+                    Bucket=bucket,
+                    CopySource={"Bucket": bucket, "Key": old_key},
                     Key=new_key
                 )
-                s3.delete_object(Bucket=config["bucket"], Key=old_key)
-            logging.info("Rename old=%s new=%s bucket=%s", old_key, new_key, config.get("bucket"))
+                runtime_s3.delete_object(Bucket=bucket, Key=old_key)
+            logging.info("Rename old=%s new=%s bucket=%s", old_key, new_key, bucket)
             return self.respond(f"<script>location='{back}'</script>")
 
         # Handle upload (including prefix when provided)
@@ -1239,8 +1334,10 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
                 if not filename:
                     continue
                 key = (prefix or "") + filename
-                s3.upload_fileobj(item.file, config["bucket"], key)
-                logging.info("Upload key=%s bucket=%s", key, config.get("bucket"))
+                if not runtime_s3 or not bucket:
+                    return self.respond_text(500, "Upload failed: storage is not configured")
+                runtime_s3.upload_fileobj(item.file, bucket, key)
+                logging.info("Upload key=%s bucket=%s", key, bucket)
             back = f"/?prefix={urllib.parse.quote(prefix)}" if prefix else "/"
             return self.respond(f"<script>location='{back}'</script>")
         except Exception as e:
@@ -1253,7 +1350,6 @@ class ReusableTCPServer(socketserver.TCPServer):
 
 setup_logging()
 init_auth_db()
-apply_db_settings()
 try:
     with ReusableTCPServer(("", PORT), UploadHandler) as httpd:
         logging.info("Serving S3 manager on port %s (HTTP)", PORT)

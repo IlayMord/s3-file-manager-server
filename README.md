@@ -48,7 +48,8 @@ Stop:
 docker compose -f docker/docker-compose.yml down
 ```
 
-The compose file includes PostgreSQL and wires `S3FM_DB_URL` automatically.
+The repository includes `docker/.env` as a sample environment file for local and demo usage.
+Update it as needed, then run compose. PostgreSQL and `S3FM_DB_URL` are wired from that file.
 
 ## ☁️ Terraform (NLB + ASG Auto Deploy)
 This repo includes Terraform modules that create a VPC + Network Load Balancer
