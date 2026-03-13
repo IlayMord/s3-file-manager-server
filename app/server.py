@@ -20,9 +20,9 @@ import psycopg2.extras
 
 def resolve_port():
     try:
-        return int(os.getenv("S3FM_PORT", "80"))
+        return int(os.getenv("S3FM_PORT", "8000"))
     except Exception:
-        return 80
+        return 8000
 
 
 def resolve_config_dir():

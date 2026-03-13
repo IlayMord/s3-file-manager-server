@@ -35,6 +35,7 @@ python3 app/server.py
 Then open `http://localhost:80` in your browser (or the port you set).
 
 ### Local env vars
+- `S3FM_PORT` (default: `8000`)
 - `S3FM_DB_URL` (default: `postgresql://postgres:postgres@localhost:5432/s3_file_manager`)
 
 ## 🐳 Docker
@@ -50,6 +51,7 @@ docker compose -f docker/docker-compose.yml down
 
 The repository includes `docker/.env` as a sample environment file for local and demo usage.
 Update it as needed, then run compose. PostgreSQL and `S3FM_DB_URL` are wired from that file.
+The Python app listens internally on port `8000`, and Nginx is exposed on port `80`.
 
 ## ☁️ Terraform (NLB + ASG Auto Deploy)
 This repo includes Terraform modules that create a VPC + Network Load Balancer
