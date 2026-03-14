@@ -12,40 +12,14 @@ services:
       - ../app/data:/app/data
     environment:
       - S3FM_PORT=8000
-      - S3FM_DB_URL=postgresql://${POSTGRES_USER:-s3fm}:${POSTGRES_PASSWORD:-s3fm}@postgres:5432/${POSTGRES_DB:-s3_file_manager}
-    depends_on:
-      - postgres
+      - S3FM_DB_URL=${S3FM_DB_URL}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
-
-  postgres:
-    image: postgres:16
-    container_name: s3fm-postgres
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-s3fm}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-s3fm}
-      POSTGRES_DB: ${POSTGRES_DB:-s3_file_manager}
-    volumes:
-      - s3fm_pg_data:/var/lib/postgresql/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-s3fm} -d ${POSTGRES_DB:-s3_file_manager}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - s3fm-network
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
 
   nginx:
     image: nginx:latest
@@ -57,10 +31,7 @@ services:
       - s3-file-manager
     networks:
       - s3fm-network
-
-volumes:
-  s3fm_pg_data:
-
+      
 networks:
   s3fm-network:
     driver: bridge

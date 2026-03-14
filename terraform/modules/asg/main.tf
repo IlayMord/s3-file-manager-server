@@ -26,9 +26,7 @@ fi
 cd s3-file-manager-server/docker
 
 cat <<EOT > .env
-POSTGRES_USER=s3fm
-POSTGRES_PASSWORD=s3fm
-POSTGRES_DB=s3_file_manager
+S3FM_DB_URL=postgresql://${var.db_username}:${var.db_password}@${var.db_endpoint}:5432/${var.db_name}
 EOT
 
 docker-compose up -d

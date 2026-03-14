@@ -32,7 +32,7 @@ python3 -m pip install -r app/requirements.txt
 python3 app/server.py
 ```
 
-Then open `http://localhost:80` in your browser (or the port you set).
+Then open `http://localhost:8000` in your browser (or the port you set).
 
 ### Local env vars
 - `S3FM_PORT` (default: `8000`)
@@ -50,28 +50,29 @@ docker compose -f docker/docker-compose.yml down
 ```
 
 The repository includes `docker/.env` as a sample environment file for local and demo usage.
-Update it as needed, then run compose. PostgreSQL and `S3FM_DB_URL` are wired from that file.
+Update `S3FM_DB_URL` with a real PostgreSQL or RDS connection string before running compose.
 The Python app listens internally on port `8000`, and Nginx is exposed on port `80`.
 
-## ☁️ Terraform (NLB + ASG Auto Deploy)
-This repo includes Terraform modules that create a VPC + Network Load Balancer
-and an Auto Scaling Group. The ASG uses user-data to clone this repo and start
-the Docker container.
+## ☁️ Terraform (NLB + ASG + RDS Auto Deploy)
+This repo includes Terraform modules that create a VPC, Network Load Balancer,
+Auto Scaling Group, and an RDS PostgreSQL instance. The ASG uses user-data to
+clone this repo, write `S3FM_DB_URL`, and start the Docker services.
 
 ### Steps
 1) Configure AWS credentials locally.
-2) Set your SSH key pair name in `terraform/variables.tf` (`key_name`).
-3) Run Terraform:
+2) Make sure the S3 backend resources in `terraform/backend.tf` already exist.
+3) Set your SSH key pair name in `terraform/variables.tf` (`key_name`).
+4) Provide a database password at apply time:
 ```bash
 cd terraform
 terraform init
-terraform apply
+terraform apply -var="db_password=CHANGE_ME"
 ```
-4) When it finishes, grab the NLB DNS name:
+5) When it finishes, grab the NLB DNS name:
 ```bash
 terraform output nlb_dns_name
 ```
-5) Open in your browser:
+6) Open in your browser:
 ```
 http://<NLB_DNS_NAME>
 ```
@@ -79,12 +80,14 @@ http://<NLB_DNS_NAME>
 ### What user-data does
 - Installs Docker + Docker Compose
 - Clones this repository
+- Writes `S3FM_DB_URL` for the RDS instance into `docker/.env`
 - Runs `docker-compose up -d` from `docker/`
 
 ### Modules
-- `terraform/modules/vpc` creates the VPC, subnet, and security group.
+- `terraform/modules/vpc` creates the VPC, subnets, and security group.
 - `terraform/modules/nlb` creates the Network Load Balancer and target group.
 - `terraform/modules/asg` creates the Auto Scaling Group and injects user-data.
+- `terraform/modules/rds` creates the PostgreSQL RDS instance and DB subnet group.
 
 ## ⚙️ Configuration
 The app stores configuration in:
@@ -92,7 +95,7 @@ The app stores configuration in:
 - `/tmp/s3-file-manager/app_config.json` (fallback)
 
 You can override paths/ports with environment variables:
-- `S3FM_PORT` (default: `80`)
+- `S3FM_PORT` (default: `8000`)
 - `S3FM_CONFIG_DIR`
 - `S3FM_DB_URL`
 
@@ -114,7 +117,8 @@ cannot be decrypted.
 ![Architecture Diagram](docs/architecture.png)
 
 This diagram shows the full deployment architecture:
-- Terraform provisions the AWS infrastructure (VPC, NLB, ASG, Security Group).
+- Terraform provisions the AWS infrastructure (VPC, NLB, ASG, Security Group, RDS).
 - ASG instances run Docker and Docker Compose.
-- The application runs as a container and accesses Amazon S3 using an IAM Role.
+- Nginx listens on port 80 and proxies traffic to the Python app on port 8000.
+- The application connects to PostgreSQL through `S3FM_DB_URL`.
 - Users access the web UI via HTTP on port 80.

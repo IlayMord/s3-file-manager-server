@@ -67,3 +67,23 @@ resource "aws_security_group" "web_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
+
+resource "aws_subnet" "private_1" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_1_cidr
+  availability_zone = "us-east-1a"
+
+  tags = {
+    Name = "s3-file-manager-private-subnet-1"
+  }
+}
+
+resource "aws_subnet" "private_2" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_2_cidr
+  availability_zone = "us-east-1b"
+
+  tags = {
+    Name = "s3-file-manager-private-subnet-2"
+  }
+}
