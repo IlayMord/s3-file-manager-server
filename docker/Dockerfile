@@ -15,5 +15,5 @@ COPY app/static/ ./static/
 RUN useradd -m appuser
 USER appuser
 
-EXPOSE 80
+EXPOSE 8000
 CMD ["python", "server.py"]

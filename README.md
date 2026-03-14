@@ -111,6 +111,7 @@ cannot be decrypted.
 - `/download` streams to the browser. `/download-server` saves to `/tmp/<filename>` on the server host.
 - Credentials are stored locally on the server and are encrypted.
 - On first run, open `/register` to create a user and store AWS credentials.
+- The current RDS settings include backup retention and deletion protection. For teardown, relax those settings intentionally before destroying the stack.
 
 ## 🏗 Architecture Diagram
 

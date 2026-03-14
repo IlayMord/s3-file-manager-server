@@ -392,6 +392,12 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(text.encode("utf-8"))
 
+    def respond_json(self, status, payload):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode("utf-8"))
+
     def current_user(self):
         cookies = parse_cookies(self.headers.get("Cookie", ""))
         token = cookies.get("s3fm_session")
@@ -511,6 +517,20 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
 
         if p.path.startswith("/static/"):
             return self.serve_static(p.path)
+
+        if p.path == "/healthz":
+            return self.respond_json(200, {"status": "ok"})
+
+        if p.path == "/readyz":
+            try:
+                with get_db_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                return self.respond_json(200, {"status": "ready"})
+            except Exception as e:
+                logging.warning("Readiness check failed: %s", e)
+                return self.respond_json(503, {"status": "not_ready"})
 
         if not self.require_auth():
             return
